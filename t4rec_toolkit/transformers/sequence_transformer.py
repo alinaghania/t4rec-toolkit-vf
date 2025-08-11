@@ -83,11 +83,11 @@ class SequenceTransformer(BaseTransformer):
         numeric_ratio = (~numeric_series.isna()).mean()
 
         # Statistiques si numérique
-        stats = {}
+        column_stats = {}
         if numeric_ratio > 0:
             valid_values = numeric_series.dropna()
             if len(valid_values) > 0:
-                stats.update(
+                column_stats.update(
                     {
                         "mean": valid_values.mean(),
                         "std": valid_values.std(),
@@ -126,11 +126,11 @@ class SequenceTransformer(BaseTransformer):
             )
 
         # Recommandations sur la configuration
-        if stats and "std" in stats:
-            if stats["std"] == 0:
+        if column_stats and "std" in column_stats:
+            if column_stats["std"] == 0:
                 warnings.append("Colonne constante")
                 recommendations.append("Considérer l'exclusion de cette colonne")
-            elif stats["std"] < 0.1:
+            elif column_stats["std"] < 0.1:
                 recommendations.append(
                     "Considérer une normalisation ou standardisation "
                     "due à la faible variance"
@@ -155,7 +155,7 @@ class SequenceTransformer(BaseTransformer):
             quality_level=quality,
             recommendations=recommendations,
             warnings=warnings,
-            stats=stats,
+            stats=column_stats,
         )
 
     def _suggest_parameters(
@@ -207,6 +207,7 @@ class SequenceTransformer(BaseTransformer):
 
         # Obtenir les colonnes
         columns = self.get_feature_columns(data, feature_columns)
+        self.feature_columns = columns  # Stocker pour utilisation dans transform()
 
         # Analyser chaque colonne
         analyses = {}
@@ -264,8 +265,9 @@ class SequenceTransformer(BaseTransformer):
             else:
                 self.logger.warning(msg)
 
-        # Continuer avec le fit standard
-        return super().fit(data, feature_columns, **kwargs)
+        # Marquer comme fitted et retourner self pour le chaînage
+        self.is_fitted = True
+        return self
 
     def transform(self, data: pd.DataFrame) -> TransformationResult:
         """
@@ -274,7 +276,47 @@ class SequenceTransformer(BaseTransformer):
         Args:
             data: DataFrame à transformer
         """
-        result = super().transform(data)
+        self._check_fitted()
+
+        transformed_data = {}
+        feature_info = {}
+        original_columns = []
+        transformation_steps = []
+
+        for col in self.feature_columns:
+            if col not in data.columns:
+                raise TransformationError(
+                    f"Colonne manquante pour la transformation: {col}",
+                    transformer_name=self.name,
+                    step="transform",
+                )
+
+            # Transformer la colonne (simple normalisation pour l'instant)
+            values = pd.to_numeric(data[col], errors="coerce").fillna(0)
+            # Normalisation min-max simple
+            if values.max() != values.min():
+                normalized_values = (values - values.min()) / (
+                    values.max() - values.min()
+                )
+            else:
+                normalized_values = values
+
+            # Stocker les résultats
+            feature_name = f"{col}_seq"
+            transformed_data[feature_name] = normalized_values.astype("float32")
+
+            feature_info[feature_name] = {
+                "original_column": col,
+                "dtype": "float32",
+                "shape": normalized_values.shape,
+                "is_sequence": True,
+                "is_categorical": False,
+                "min_value": float(normalized_values.min()),
+                "max_value": float(normalized_values.max()),
+            }
+
+            original_columns.append(col)
+            transformation_steps.append(f"normalize_sequence_{col}")
 
         # Ajouter les métriques de qualité
         quality_metrics = {}
@@ -288,7 +330,20 @@ class SequenceTransformer(BaseTransformer):
                     "recommendations": analysis.recommendations,
                 }
 
-        result.statistics["quality_metrics"] = quality_metrics
+                # Créer le résultat
+        from t4rec_toolkit.core.base_transformer import TransformationResult
+
+        result = TransformationResult(
+            data=transformed_data,
+            feature_info=feature_info,
+            original_columns=original_columns,
+            transformation_steps=transformation_steps,
+            config={
+                "quality_metrics": quality_metrics,
+                "n_features_in": len(self.feature_columns),
+                "n_features_out": len(transformed_data),
+            },
+        )
 
         return result
 
@@ -315,3 +370,46 @@ class SequenceTransformer(BaseTransformer):
                 for name, analysis in self.column_analyses.items()
             },
         }
+
+    def _auto_detect_features(self, data: pd.DataFrame) -> List[str]:
+        """
+        Détecte automatiquement les colonnes appropriées pour la transformation séquentielle.
+
+        Args:
+            data: DataFrame à analyser
+
+        Returns:
+            Liste des noms de colonnes adaptées à la transformation séquentielle
+        """
+        suitable_columns = []
+
+        for col in data.columns:
+            try:
+                # Vérifier si la colonne contient des données numériques ou convertibles
+                series = data[col]
+
+                # Ignorer les colonnes avec trop de valeurs manquantes
+                if series.isnull().sum() / len(series) > 0.5:
+                    continue
+
+                # Vérifier si la colonne est numérique ou peut être convertie
+                if pd.api.types.is_numeric_dtype(series):
+                    suitable_columns.append(col)
+                elif pd.api.types.is_object_dtype(series):
+                    # Essayer de convertir en numérique
+                    try:
+                        pd.to_numeric(series.dropna().head(100))
+                        suitable_columns.append(col)
+                    except (ValueError, TypeError):
+                        # Vérifier si c'est une séquence de nombres (format string)
+                        sample_values = series.dropna().head(10)
+                        if len(sample_values) > 0:
+                            first_val = str(sample_values.iloc[0])
+                            # Chercher des patterns de séquences : [1,2,3] ou "1 2 3"
+                            if any(char in first_val for char in ["[", ",", " "]):
+                                suitable_columns.append(col)
+
+            except Exception:
+                continue
+
+        return suitable_columns
