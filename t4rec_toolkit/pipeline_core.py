@@ -20,6 +20,14 @@ try:
 except Exception:
     _HAS_DATAIKU = False
 
+# Optional progress bars
+try:
+    from tqdm.auto import tqdm  # type: ignore
+
+    _HAS_TQDM = True
+except Exception:
+    _HAS_TQDM = False
+
 # Local toolkit
 from .transformers.sequence_transformer import SequenceTransformer
 from .transformers.categorical_transformer import CategoricalTransformer
@@ -547,7 +555,13 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
         return correct / max(1, total)
 
     history: List[Dict[str, Any]] = []
-    for epoch in range(int(trn["num_epochs"])):
+    num_epochs = int(trn["num_epochs"])
+    if progress and _HAS_TQDM:
+        pbar = tqdm(total=num_epochs, desc="Entraînement", leave=True)
+    else:
+        pbar = None
+
+    for epoch in range(num_epochs):
         train_loss = _train_epoch()
         val_acc = _evaluate()
         scheduler.step()
@@ -559,10 +573,16 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
                 "learning_rate": scheduler.get_last_lr()[0],
             }
         )
+        if pbar is not None:
+            pbar.set_postfix({"loss": f"{train_loss:.4f}", "val": f"{val_acc:.4f}"})
+            pbar.update(1)
         if verbose:
             _logger.info(
-                f"Epoch {epoch + 1}/{trn['num_epochs']} | loss={train_loss:.4f} | val_acc={val_acc:.4f}"
+                f"Epoch {epoch + 1}/{num_epochs} | loss={train_loss:.4f} | val_acc={val_acc:.4f}"
             )
+
+    if pbar is not None:
+        pbar.close()
 
     from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 
