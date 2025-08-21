@@ -1,6 +1,6 @@
 """
 Sélection intelligente de variables pour T4Rec (XLNet séquentiel).
-
+ 
 Objectif
 --------
 Limiter le coût mémoire/latence et améliorer la stabilité/performance des modèles T4Rec
@@ -8,7 +8,7 @@ en ne retenant qu'un sous-ensemble pertinent de variables (~12–15) adaptées �
 séquentielle. Chaque feature catégorielle ou séquentielle induit des embeddings, dont le coût
 est approximativement proportionnel à nb_features × longueur_de_séquence × dimension_d'embed.
 Réduire les features redondantes/peu informatives réduit significativement ce coût.
-
+ 
 Approche
 --------
 1) Détection du type de cible (binaire / multiclasse / continue)
@@ -20,10 +20,10 @@ Approche
 5) Agrégation normalisée en score composite, top-K par type et cap global
 6) Rapport détaillé avec raisons de drop, flags de sélection et journalisation
 """
-
+ 
 import logging
 from typing import Dict, List, Optional, Tuple
-
+ 
 import numpy as np
 import pandas as pd
 from scipy import stats
@@ -34,30 +34,52 @@ from sklearn.model_selection import KFold, StratifiedKFold, GroupKFold
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, OrdinalEncoder
 from sklearn.feature_selection import mutual_info_classif, mutual_info_regression
-
+import time
+ 
+try:
+    from tqdm.auto import tqdm as _tqdm  # type: ignore
+ 
+    _HAVE_TQDM = True
+except Exception:  # pragma: no cover
+    _tqdm = None  # type: ignore
+    _HAVE_TQDM = False
+ 
+# Progress toggle (set in select_features_for_t4rec)
+_PROGRESS: bool = False
+ 
+ 
+def _pbar(iterable, desc: Optional[str] = None, total: Optional[int] = None):
+    if _PROGRESS and _HAVE_TQDM:
+        try:
+            return _tqdm(iterable, desc=desc, total=total, leave=False)
+        except Exception:
+            return iterable
+    return iterable
+ 
+ 
 try:
     # Dataiku optional import
     from ..adapters import DataikuAdapter
-
+ 
     exists_dataiku = True
 except Exception:  # pragma: no cover
     exists_dataiku = False
     DataikuAdapter = None  # type: ignore
-
-
+ 
+ 
 logger = logging.getLogger(__name__)
-
-
+ 
+ 
 def _detect_target_type(y: pd.Series) -> str:
     """Détecte le type de cible.
-
+ 
     Pourquoi (T4Rec):
     - Le choix des mesures d'association et du protocole CV dépend du type de cible
       (ex. MI classification vs régression, StratifiedKFold vs KFold).
-
+ 
     Paramètres
     - y: Série pandas de la variable cible.
-
+ 
     Retour
     - 'binary' | 'multiclass' | 'continuous'
     """
@@ -74,31 +96,31 @@ def _detect_target_type(y: pd.Series) -> str:
     else:
         unique_vals = y.dropna().nunique()
         return "binary" if unique_vals == 2 else "multiclass"
-
-
+ 
+ 
 def _safe_numeric_cols(df: pd.DataFrame) -> List[str]:
     """Liste des colonnes numériques (entiers/flottants) détectées via dtypes pandas.
-
+ 
     Pourquoi (T4Rec):
     - Les variables numériques sont de bonnes candidates pour des signaux séquentiels
       (ex. montants, fréquences), et nécessitent un contrôle de corrélation.
     """
     return [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
-
-
+ 
+ 
 def _safe_categorical_cols(
     df: pd.DataFrame, exclude: Optional[List[str]] = None
 ) -> List[str]:
     """Liste des colonnes catégorielles/texte/booléennes (hors exclusions).
-
+ 
     Pourquoi (T4Rec):
     - Les features catégorielles entraînent des embeddings; leur nombre doit donc
       être maîtrisé pour contenir les coûts.
-
+ 
     Paramètres
     - df: DataFrame d'entrée (sans la cible).
     - exclude: colonnes à ignorer (ex. déjà retenues comme numériques).
-
+ 
     Retour
     - Liste de noms de colonnes catégorielles.
     """
@@ -116,24 +138,24 @@ def _safe_categorical_cols(
         elif not pd.api.types.is_numeric_dtype(df[c]):
             cols.append(c)
     return cols
-
-
+ 
+ 
 def _pearson_spearman_for_numeric(df: pd.DataFrame, y: pd.Series) -> pd.DataFrame:
     """Calcule |Pearson| et |Spearman| par feature numérique vs cible.
-
+ 
     Pourquoi (T4Rec):
     - Pearson mesure la relation linéaire, Spearman la relation monotone. Ces signaux
       complémentaires aident à prioriser des variables numériques «sequence-friendly».
-
+ 
     Paramètres
     - df: sous-DataFrame des variables numériques.
     - y: cible (encodée si nécessaire).
-
+ 
     Retour
     - DataFrame indexé par 'feature' avec colonnes 'pearson_abs', 'spearman_abs'.
     """
     rows = []
-    for col in df.columns:
+    for col in _pbar(df.columns, desc="Assoc num (Pearson/Spearman)"):
         series = df[col]
         try:
             valid = series.notna() & y.notna()
@@ -157,21 +179,21 @@ def _pearson_spearman_for_numeric(df: pd.DataFrame, y: pd.Series) -> pd.DataFram
             }
         )
     return pd.DataFrame(rows).set_index("feature")
-
-
+ 
+ 
 def _anova_kruskal_for_numeric_vs_categorical(
     df: pd.DataFrame, y: pd.Series
 ) -> pd.DataFrame:
     """ANOVA et Kruskal-Wallis pour numériques vs cible catégorielle.
-
+ 
     Pourquoi (T4Rec):
     - En présence de cibles discrètes, tester si la distribution d'une variable
       numérique varie selon les classes aide à identifier un signal utile.
-
+ 
     Paramètres
     - df: sous-DataFrame numérique.
     - y: cible catégorielle.
-
+ 
     Retour
     - DataFrame indexé 'feature' avec 'anova_f', 'anova_p', 'kruskal_h', 'kruskal_p'.
     """
@@ -186,7 +208,7 @@ def _anova_kruskal_for_numeric_vs_categorical(
             index=y.index,
         )
         return _pearson_spearman_for_numeric(df, encoded_y)
-    for col in df.columns:
+    for col in _pbar(df.columns, desc="ANOVA/Kruskal (num vs cat)"):
         series = df[col]
         try:
             groups = []
@@ -215,23 +237,23 @@ def _anova_kruskal_for_numeric_vs_categorical(
             }
         )
     return pd.DataFrame(rows).set_index("feature")
-
-
+ 
+ 
 def _mutual_info_numeric(
     df: pd.DataFrame, y: pd.Series, target_type: str, random_state: int
 ) -> pd.Series:
     """Information mutuelle pour variables numériques.
-
+ 
     Pourquoi (T4Rec):
     - Capture des relations non linéaires avec la cible, utile quand Pearson/Spearman
       sont faibles mais que le signal est présent.
-
+ 
     Paramètres
     - df: numériques
     - y: cible
     - target_type: 'binary'/'multiclass'/'continuous' (pilote le choix classif/régression)
     - random_state: reproductibilité
-
+ 
     Retour
     - Series nommée 'mutual_info' indexée par feature.
     """
@@ -246,21 +268,21 @@ def _mutual_info_numeric(
         return pd.Series(
             [np.nan] * len(df.columns), index=df.columns, name="mutual_info"
         )
-
-
+ 
+ 
 def _chi2_cramersv_for_categorical(df: pd.DataFrame, y: pd.Series) -> pd.DataFrame:
     """Cramer's V (depuis chi²) pour features catégorielles vs cible.
-
+ 
     Pourquoi (T4Rec):
     - Mesure d'association robuste pour variables qualitatives; utile pour prioriser
       les embeddings catégoriels à conserver.
-
+ 
     Retour
     - DataFrame indexé 'feature' avec colonne 'cramers_v'.
     """
     rows = []
     y_str = y.fillna("__NA__").astype(str)
-    for col in df.columns:
+    for col in _pbar(df.columns, desc="Assoc cat (Cramer's V)"):
         try:
             x_str = df[col].fillna("__NA__").astype(str)
             cont = pd.crosstab(x_str, y_str)
@@ -276,16 +298,16 @@ def _chi2_cramersv_for_categorical(df: pd.DataFrame, y: pd.Series) -> pd.DataFra
             cramers_v = np.nan
         rows.append({"feature": col, "cramers_v": cramers_v})
     return pd.DataFrame(rows).set_index("feature")
-
-
+ 
+ 
 def _mutual_info_categorical(
     df: pd.DataFrame, y: pd.Series, target_type: str, random_state: int
 ) -> pd.Series:
     """Information mutuelle pour variables catégorielles.
-
+ 
     Pourquoi (T4Rec):
     - Détecte des dépendances non linéaires entre catégories et cible.
-
+ 
     Retour
     - Series nommée 'mutual_info' indexée par feature.
     """
@@ -301,22 +323,22 @@ def _mutual_info_categorical(
         return pd.Series(
             [np.nan] * len(df.columns), index=df.columns, name="mutual_info"
         )
-
-
+ 
+ 
 def _numeric_multicollinearity_filter(
     df_numeric: pd.DataFrame,
     threshold: float = 0.9,
 ) -> Tuple[List[str], List[Tuple[str, str, float]]]:
     """Filtre glouton de multicolinéarité sur variables numériques.
-
+ 
     Pourquoi (T4Rec):
     - Deux variables très corrélées impliquent des embeddings et un coût redondants;
       en garder une seule réduit la charge mémoire/latence et le risque d'overfit.
-
+ 
     Paramètres
     - df_numeric: sous-DataFrame de variables numériques
     - threshold: seuil de corrélation absolue au-delà duquel on droppe la variable redondante
-
+ 
     Retour
     - (kept, pairs): kept = liste des variables conservées; pairs = [(keep, drop, |r|)]
     """
@@ -326,7 +348,7 @@ def _numeric_multicollinearity_filter(
     upper = corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool))
     to_drop: set = set()
     drop_pairs: List[Tuple[str, str, float]] = []
-    for col in upper.columns:
+    for col in _pbar(upper.columns, desc="Filtre corrélation (num)"):
         if col in to_drop:
             continue
         for row, v in upper[col].dropna().items():
@@ -335,8 +357,8 @@ def _numeric_multicollinearity_filter(
                 drop_pairs.append((col, row, float(v)))
     kept = [c for c in df_numeric.columns if c not in to_drop]
     return kept, drop_pairs
-
-
+ 
+ 
 def _rf_importance_with_cv(
     X_num: pd.DataFrame,
     X_cat: pd.DataFrame,
@@ -348,11 +370,11 @@ def _rf_importance_with_cv(
     groups: Optional[pd.Series] = None,
 ) -> pd.Series:
     """Importance des features via RandomForest et validation croisée.
-
+ 
     Pourquoi (T4Rec):
     - Donne une vision «modèle» des variables utiles après prétraitements, et
       renforce la robustesse via agrégation sur plusieurs folds (Stratified/GroupKFold).
-
+ 
     Paramètres
     - X_num: features numériques
     - X_cat: features catégorielles
@@ -362,7 +384,7 @@ def _rf_importance_with_cv(
     - random_state: graine de reproductibilité
     - class_weight_balanced: pondération des classes (utile en cas de déséquilibre)
     - groups: groupes pour GroupKFold (ex: client_id) pour éviter la fuite de données
-
+ 
     Retour
     - Series des importances moyennes par feature (agrégée par feature d'origine)
     """
@@ -385,7 +407,7 @@ def _rf_importance_with_cv(
         ],
         sparse_threshold=0.3,
     )
-
+ 
     if target_type in ("binary", "multiclass"):
         model = RandomForestClassifier(
             n_estimators=200,
@@ -413,17 +435,20 @@ def _rf_importance_with_cv(
             if groups is not None
             else KFold(n_splits=n_splits, shuffle=True, random_state=random_state)
         )
-
+ 
     feature_importance_acc: Dict[str, List[float]] = {
         f: [] for f in list(X_num.columns) + list(X_cat.columns)
     }
-
+ 
     split_iter = (
         cv.split(pd.DataFrame(index=y.index), y, groups=groups)
         if groups is not None
         else cv.split(pd.DataFrame(index=y.index), y)
     )
-    for train_idx, valid_idx in split_iter:
+    for _ in _pbar(range(0), desc=""):  # no-op to satisfy linter when tqdm missing
+        pass
+    for train_valid in _pbar(split_iter, desc="RF-CV", total=n_splits):
+        train_idx, valid_idx = train_valid
         Xn_tr = (
             X_num.iloc[train_idx]
             if X_num is not None and not X_num.empty
@@ -445,13 +470,13 @@ def _rf_importance_with_cv(
             else pd.DataFrame(index=valid_idx)
         )
         y_tr, y_va = y.iloc[train_idx], y.iloc[valid_idx]
-
+ 
         pipe = Pipeline(steps=[("pre", pre), ("model", model)])
         pipe.fit(pd.concat([Xn_tr, Xc_tr], axis=1), y_tr)
-
+ 
         preproc: ColumnTransformer = pipe.named_steps["pre"]
         model_fitted = pipe.named_steps["model"]
-
+ 
         num_feats = list(X_num.columns) if X_num is not None else []
         cat_feats = list(X_cat.columns) if X_cat is not None else []
         try:
@@ -466,7 +491,7 @@ def _rf_importance_with_cv(
                 ct_feature_names.extend(onehot_names)
         except Exception:
             continue
-
+ 
         try:
             importances = getattr(model_fitted, "feature_importances_", None)
             if importances is None:
@@ -474,7 +499,7 @@ def _rf_importance_with_cv(
             importances = np.asarray(importances)
         except Exception:
             continue
-
+ 
         pointer = 0
         for f in num_feats:
             if pointer >= len(importances):
@@ -491,14 +516,14 @@ def _rf_importance_with_cv(
                 seg = importances[pointer : pointer + n_levels]
                 feature_importance_acc[f].append(float(seg.sum()))
                 pointer += n_levels
-
+ 
     mean_importance = {
         f: (np.mean(v) if len(v) > 0 else 0.0)
         for f, v in feature_importance_acc.items()
     }
     return pd.Series(mean_importance)
-
-
+ 
+ 
 def select_features_for_t4rec(
     dataset_name: Optional[str],
     df: Optional[pd.DataFrame],
@@ -514,13 +539,14 @@ def select_features_for_t4rec(
     verbose: bool = True,
     group_col: Optional[str] = None,
     class_weight_balanced: bool = True,
+    progress: bool = True,
 ) -> Dict[str, object]:
     """Pipeline complète de sélection de variables pour T4Rec.
-
+ 
     Pourquoi (T4Rec):
     - Limiter le nombre de features pour contenir le coût des embeddings et améliorer la stabilité.
     - Privilégier des variables porteuses d'un signal temporel fort et réduire la redondance.
-
+ 
     Paramètres
     - dataset_name: nom du dataset Dataiku (si None, utiliser df)
     - df: DataFrame local (si None, charger dataset_name)
@@ -536,7 +562,8 @@ def select_features_for_t4rec(
     - verbose: activer les logs détaillés
     - group_col: colonne de groupe (ex. client_id) pour GroupKFold
     - class_weight_balanced: activer la pondération des classes pour RF (classification)
-
+    - progress: afficher des barres de progression (tqdm) si disponible
+ 
     Retour
     - dict avec:
       - 'target_type': type de cible
@@ -544,9 +571,12 @@ def select_features_for_t4rec(
       - 'selected_sequence_cols' / 'selected_categorical_cols': sélection finale
       - 'report': DataFrame du rapport détaillé (scores, flags, raisons)
     """
+    global _PROGRESS
+    _PROGRESS = bool(progress)
     if verbose:
         logger.info("[FeatureSelection] Starting feature selection...")
-
+    t_global0 = time.time()
+ 
     if df is None:
         if dataset_name is None:
             raise ValueError("Either df or dataset_name must be provided")
@@ -561,10 +591,15 @@ def select_features_for_t4rec(
     else:
         if sample_size is not None and len(df) > sample_size:
             df = df.sample(n=sample_size, random_state=random_state)
-
+ 
+    if verbose:
+        logger.info(
+            f"[FeatureSelection] Data loaded: {df.shape[0]:,} rows × {df.shape[1]} cols (sample_size={sample_size})"
+        )
+ 
     if target_col not in df.columns:
         raise ValueError(f"Target column '{target_col}' not in DataFrame")
-
+ 
     y = df[target_col]
     X = df.drop(columns=[target_col])
     target_type = _detect_target_type(y)
@@ -572,22 +607,22 @@ def select_features_for_t4rec(
         logger.info(
             f"[FeatureSelection] Target '{target_col}' detected as: {target_type}"
         )
-
+ 
     numeric_cols = _safe_numeric_cols(X)
     categorical_cols = _safe_categorical_cols(X, exclude=numeric_cols)
     if verbose:
         logger.info(
             f"[FeatureSelection] Candidates — numeric: {len(numeric_cols)}, categorical: {len(categorical_cols)}"
         )
-
+ 
     reports: List[pd.DataFrame] = []
+    t_assoc0 = time.time()
     if target_type == "continuous":
         num_assoc = _pearson_spearman_for_numeric(X[numeric_cols], y)
         num_assoc["mutual_info"] = _mutual_info_numeric(
             X[numeric_cols], y, target_type, random_state
         )
         reports.append(num_assoc.add_prefix("num_"))
-        # Categorical vs continuous handled via fallback in ANOVA function
         _ = _anova_kruskal_for_numeric_vs_categorical(X[numeric_cols], y)
     else:
         num_assoc = _pearson_spearman_for_numeric(
@@ -603,8 +638,13 @@ def select_features_for_t4rec(
         )
         cat_assoc = cat_assoc1.join(cat_assoc2, how="outer")
         reports.append(cat_assoc.add_prefix("cat_"))
-
+    if verbose:
+        logger.info(
+            f"[FeatureSelection] Associations computed in {time.time() - t_assoc0:.2f}s"
+        )
+ 
     # Multicollinearity (numeric) with details
+    t_mc0 = time.time()
     if len(numeric_cols) > 0:
         kept_numeric, drop_pairs = _numeric_multicollinearity_filter(
             X[numeric_cols], threshold=corr_threshold
@@ -612,18 +652,19 @@ def select_features_for_t4rec(
         dropped_numeric = [d for _, d, _ in drop_pairs]
         if verbose:
             logger.info(
-                f"[FeatureSelection] Multicollinearity — kept: {len(kept_numeric)}, dropped: {len(dropped_numeric)} (threshold={corr_threshold})"
+                f"[FeatureSelection] Multicollinearity — kept: {len(kept_numeric)}, dropped: {len(dropped_numeric)} (threshold={corr_threshold}) in {time.time() - t_mc0:.2f}s"
             )
-            for i, (keep_f, drop_f, r) in enumerate(drop_pairs[:20]):
+            for i, (keep_f, drop_f, r) in enumerate(drop_pairs[:10]):
                 logger.info(
                     f"  drop '{drop_f}' due to high corr with '{keep_f}' (|r|={r:.3f})"
                 )
     else:
         kept_numeric, drop_pairs = [], []
         dropped_numeric = []
-
+ 
     if verbose:
         logger.info("[FeatureSelection] Computing model-based importances (CV)...")
+    t_rf0 = time.time()
     groups = (
         df[group_col] if (group_col is not None and group_col in df.columns) else None
     )
@@ -637,7 +678,11 @@ def select_features_for_t4rec(
         class_weight_balanced=class_weight_balanced,
         groups=groups,
     )
-
+    if verbose:
+        logger.info(
+            f"[FeatureSelection] RF-CV importances computed in {time.time() - t_rf0:.2f}s"
+        )
+ 
     scores = pd.DataFrame(index=list(X.columns))
     if len(numeric_cols) > 0:
         for col in ["num_pearson_abs", "num_spearman_abs", "num_mutual_info"]:
@@ -660,7 +705,7 @@ def select_features_for_t4rec(
         if mi_max and mi_max > 0
         else scores["model_importance"]
     )
-
+ 
     if target_type in ("binary", "multiclass"):
         weights = {
             "num_pearson_abs": 0.2,
@@ -684,16 +729,21 @@ def select_features_for_t4rec(
     w_sum = sum(weights[k] for k in present)
     for k in present:
         weights[k] = weights[k] / w_sum if w_sum > 0 else 0
+    if verbose:
+        logger.info(
+            f"[FeatureSelection] Composite weights used (present only): { {k: round(weights[k], 3) for k in present} }"
+        )
+ 
     scores["composite_score"] = sum(
         scores.get(k, pd.Series(0.0, index=scores.index)) * weights[k] for k in present
     )
-
+ 
     # Flags for reasons
     reasons = pd.Series("", index=scores.index)
     if dropped_numeric:
         for keep_f, drop_f, r in drop_pairs:
             reasons[drop_f] = f"dropped_corr_with:{keep_f}|r={r:.3f}"
-
+ 
     numeric_ranked = (
         scores.loc[kept_numeric]
         .sort_values("composite_score", ascending=False)
@@ -710,7 +760,7 @@ def select_features_for_t4rec(
         if len(categorical_cols) > 0
         else []
     )
-
+ 
     if total_feature_cap is not None:
         combined = pd.concat(
             [
@@ -727,15 +777,19 @@ def select_features_for_t4rec(
         categorical_ranked = [
             f for f, row in combined.iterrows() if row["_type"] == "categorical"
         ]
-
+ 
     selected_final_set = set(numeric_ranked + categorical_ranked)
     if verbose:
         logger.info(
             f"[FeatureSelection] Selected — numeric: {len(numeric_ranked)}, categorical: {len(categorical_ranked)}, total: {len(selected_final_set)}"
         )
-        logger.info(f"  numeric: {numeric_ranked}")
-        logger.info(f"  categorical: {categorical_ranked}")
-
+        logger.info(
+            f"  numeric: {numeric_ranked[:5]}{'...' if len(numeric_ranked) > 5 else ''}"
+        )
+        logger.info(
+            f"  categorical: {categorical_ranked[:5]}{'...' if len(categorical_ranked) > 5 else ''}"
+        )
+ 
     report_df = scores.copy()
     report_df.insert(
         0,
@@ -759,16 +813,16 @@ def select_features_for_t4rec(
         report_df["drop_reason"] == ""
     )
     report_df.loc[non_selected_mask, "drop_reason"] = "below_topK_or_cap"
-
+ 
     report_df = report_df.sort_values(
         ["feature_type", "selected_final", "composite_score"],
         ascending=[True, False, False],
     )
-
+ 
     if report_output_dir:
         try:
             import os
-
+ 
             os.makedirs(report_output_dir, exist_ok=True)
             name = dataset_name or "dataframe"
             report_path = os.path.join(
@@ -779,7 +833,7 @@ def select_features_for_t4rec(
                 logger.info(f"[FeatureSelection] Saved report to {report_path}")
         except Exception as e:
             logger.warning(f"[FeatureSelection] Could not save local report: {e}")
-
+ 
     if report_dataset and exists_dataiku:
         try:
             adapter = DataikuAdapter()
@@ -795,7 +849,10 @@ def select_features_for_t4rec(
             logger.warning(
                 f"[FeatureSelection] Could not save to Dataiku dataset '{report_dataset}': {e}"
             )
-
+ 
+    if verbose:
+        logger.info(f"[FeatureSelection] Done in {time.time() - t_global0:.2f}s")
+ 
     return {
         "target_type": target_type,
         "numeric_candidates": numeric_cols,
@@ -804,3 +861,5 @@ def select_features_for_t4rec(
         "selected_categorical_cols": categorical_ranked,
         "report": report_df,
     }
+ 
+ 
