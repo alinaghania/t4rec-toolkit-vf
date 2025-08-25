@@ -380,12 +380,27 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
     seq_transformer = SequenceTransformer()
     cat_transformer = CategoricalTransformer()
 
-    seq_result = seq_transformer.fit(df[seq_cols_filtered]).transform(
-        df[seq_cols_filtered]
-    )
-    cat_result = cat_transformer.fit(df[cat_cols_filtered]).transform(
-        df[cat_cols_filtered]
-    )
+    if config["runtime"]["verbose"]:
+        logger.info(
+            f"Starting sequence transformation for columns: {seq_cols_filtered}"
+        )
+
+    seq_result = seq_transformer.fit_transform(df, seq_cols_filtered)
+
+    if config["runtime"]["verbose"]:
+        logger.info(
+            f"Sequence transformation completed. Output keys: {list(seq_result.data.keys())}"
+        )
+        logger.info(
+            f"Starting categorical transformation for columns: {cat_cols_filtered}"
+        )
+
+    cat_result = cat_transformer.fit_transform(df, cat_cols_filtered)
+
+    if config["runtime"]["verbose"]:
+        logger.info(
+            f"Categorical transformation completed. Output keys: {list(cat_result.data.keys())}"
+        )
 
     # Prepare target
     from sklearn.preprocessing import LabelEncoder
@@ -402,8 +417,8 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
     if config["runtime"]["verbose"]:
         logger.info(f"Sequence result keys: {list(seq_result.data.keys())}")
         logger.info(f"Categorical result keys: {list(cat_result.data.keys())}")
-        logger.info(f"Expected sequence cols: {seq_cols}")
-        logger.info(f"Expected categorical cols: {cat_cols}")
+        logger.info(f"Expected sequence cols (filtered): {seq_cols_filtered}")
+        logger.info(f"Expected categorical cols (filtered): {cat_cols_filtered}")
 
     # Add sequence features (transformers create "{col}_seq" keys)
     for col in seq_cols_filtered:
