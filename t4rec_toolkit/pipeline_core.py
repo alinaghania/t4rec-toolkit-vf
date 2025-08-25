@@ -210,11 +210,23 @@ def _load_dataframe(dataset_name: str, sample_size: int) -> pd.DataFrame:
 class BankingRecommendationModel(torch.nn.Module):
     """Hybrid T4Rec XLNet model for banking product recommendation"""
 
-    def __init__(self, embedding_module, xlnet_config, n_products, d_model):
+    def __init__(
+        self,
+        embedding_module,
+        xlnet_config,
+        n_products,
+        d_model,
+        embedding_output_dim=None,
+    ):
         super().__init__()
         self.embedding_module = embedding_module
         self.transformer = tr.TransformerBlock(xlnet_config)
         self.n_products = n_products
+
+        # Add projection layer if embedding output doesn't match XLNet d_model
+        self.projection = None
+        if embedding_output_dim and embedding_output_dim != d_model:
+            self.projection = torch.nn.Linear(embedding_output_dim, d_model)
 
         # Prediction head
         self.recommendation_head = torch.nn.Sequential(
@@ -234,7 +246,11 @@ class BankingRecommendationModel(torch.nn.Module):
         # 1. T4Rec embeddings
         embeddings = self.embedding_module(inputs)
 
-        # 2. XLNet transformer
+        # 2. Project to correct dimensions if needed
+        if self.projection is not None:
+            embeddings = self.projection(embeddings)
+
+        # 3. XLNet transformer
         try:
             transformer_output = self.transformer(embeddings)
         except:
@@ -308,20 +324,41 @@ def _create_t4rec_model(
             0, model_config["vocab_size"], (2, model_config["max_sequence_length"])
         )
 
+    # Initialize variables
+    embedding_output_dim = None
+
     with torch.no_grad():
         try:
             test_output = embedding_module(test_batch)
-            actual_d_model = test_output.shape[-1]
+            detected_d_model = test_output.shape[-1]
+
+            # Use configured d_model for XLNet (must be divisible by n_heads)
+            # Store the detected dimension for projection layer
+            embedding_output_dim = detected_d_model
+            n_heads = model_config["n_heads"]
+            actual_d_model = d_model  # Use configured d_model
+
+            # Ensure configured d_model is divisible by n_heads
+            if actual_d_model % n_heads != 0:
+                actual_d_model = (actual_d_model // n_heads) * n_heads
+                if config["runtime"]["verbose"]:
+                    print(
+                        f"Adjusted configured d_model to {actual_d_model} (divisible by n_heads={n_heads})"
+                    )
+
             if config["runtime"]["verbose"]:
                 print(
-                    f"T4Rec embedding test successful: output_shape={test_output.shape}, d_model={actual_d_model}"
+                    f"T4Rec embedding: {detected_d_model}D → XLNet: {actual_d_model}D (projection: {detected_d_model != actual_d_model})"
                 )
         except Exception as e:
             if config["runtime"]["verbose"]:
                 print(
                     f"T4Rec embedding test failed: {e}, using configured d_model={d_model}"
                 )
-            actual_d_model = d_model
+            # Ensure configured d_model is also divisible by n_heads
+            embedding_output_dim = None  # No projection needed
+            n_heads = model_config["n_heads"]
+            actual_d_model = (d_model // n_heads) * n_heads
 
     # Create XLNet config
     xlnet_config = tr.XLNetConfig.build(
@@ -337,6 +374,7 @@ def _create_t4rec_model(
         xlnet_config=xlnet_config,
         n_products=model_config["vocab_size"],
         d_model=actual_d_model,
+        embedding_output_dim=embedding_output_dim,
     )
 
     return model
