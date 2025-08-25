@@ -1253,8 +1253,6 @@ def format_topk_table(metrics_by_k, baseline_metrics=None):
 
     # Table header
     header = "| Metric          |"
-    if baseline_metrics:
-        header += " Baseline      |"
     for k in sorted(metrics_by_k.keys()):
         header += f" K={k}          |"
     lines.append(header)
@@ -1267,11 +1265,6 @@ def format_topk_table(metrics_by_k, baseline_metrics=None):
         ("f1_score", "F1-Score"),
     ]:
         row = f"| {display_name:<15} |"
-
-        # Baseline column if available
-        if baseline_metrics and metric_name in baseline_metrics:
-            baseline_val = baseline_metrics[metric_name] * 100
-            row += f" {baseline_val:>5.1f}%       |"
 
         # K value columns
         for k in sorted(metrics_by_k.keys()):
@@ -1324,4 +1317,5 @@ def print_topk_results(metrics_by_k, baseline_metrics=None):
     """
     table_str = format_topk_table(metrics_by_k, baseline_metrics)
     print(table_str)
+
 
