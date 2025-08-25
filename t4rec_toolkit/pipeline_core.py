@@ -461,12 +461,40 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
     train_targets = targets[:split_idx]
     val_targets = targets[split_idx:]
 
-    # Convert to tensors
+    # Convert to tensors (handle pandas Series properly)
     train_batch = {}
     val_batch = {}
-    for col in seq_cols + cat_cols:
-        train_batch[col] = torch.tensor(train_data[col], dtype=torch.long)
-        val_batch[col] = torch.tensor(val_data[col], dtype=torch.long)
+    for col in seq_cols_filtered + cat_cols_filtered:
+        # Convert pandas Series to numpy arrays first
+        train_values = (
+            np.array(train_data[col])
+            if hasattr(train_data[col], "values")
+            else train_data[col]
+        )
+        val_values = (
+            np.array(val_data[col])
+            if hasattr(val_data[col], "values")
+            else val_data[col]
+        )
+
+        # Convert to proper format for T4Rec embeddings
+        # All features need to be integers for embedding layers
+        if col in seq_cols_filtered:
+            # For sequence features, discretize float values to integers
+            train_values_int = (train_values * 1000).astype(
+                int
+            )  # Scale and convert to int
+            val_values_int = (val_values * 1000).astype(int)
+            train_batch[col] = torch.tensor(train_values_int, dtype=torch.long)
+            val_batch[col] = torch.tensor(val_values_int, dtype=torch.long)
+        else:  # categorical
+            train_batch[col] = torch.tensor(train_values.astype(int), dtype=torch.long)
+            val_batch[col] = torch.tensor(val_values.astype(int), dtype=torch.long)
+
+        if config["runtime"]["verbose"]:
+            logger.info(
+                f"Converted {col}: train_shape={train_values.shape}, val_shape={val_values.shape}"
+            )
 
     train_targets_tensor = torch.tensor(train_targets, dtype=torch.long)
     val_targets_tensor = torch.tensor(val_targets, dtype=torch.long)
