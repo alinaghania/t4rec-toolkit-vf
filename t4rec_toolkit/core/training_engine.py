@@ -30,9 +30,19 @@ try:
 except ImportError:
     _HAS_DATAIKU = False
 
-from ..transformers.sequence_transformer import SequenceTransformer
-from ..transformers.categorical_transformer import CategoricalTransformer
-from ..models.t4rec_advanced import T4RecAdvancedModel
+try:
+    from ..transformers.sequence_transformer import SequenceTransformer
+    from ..transformers.categorical_transformer import CategoricalTransformer
+    from ..models.t4rec_advanced import T4RecAdvancedModel
+except ImportError:
+    # Fallback for direct execution
+    import sys
+    import os
+
+    sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+    from transformers.sequence_transformer import SequenceTransformer
+    from transformers.categorical_transformer import CategoricalTransformer
+    from models.t4rec_advanced import T4RecAdvancedModel
 
 
 class TrainingEngine:
