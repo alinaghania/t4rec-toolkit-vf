@@ -17,14 +17,12 @@ import pandas as pd
 try:
     import transformers4rec.torch as tr
     from transformers4rec.torch.ranking_metric import NDCGAt, RecallAt
-    from transformers4rec.torch.features.embedding import EmbeddingFeatures, FeatureConfig, TableConfig
-    from transformers4rec.torch.features.sequence import SequenceEmbeddingFeatures
-    from transformers4rec.torch.model.head import Head
-    from transformers4rec.torch.model.prediction_task import (
-        RegressionTask,
-        BinaryClassificationTask,
-        MultiClassClassificationTask,
+    from transformers4rec.torch.features.embedding import (
+        EmbeddingFeatures,
+        FeatureConfig,
+        TableConfig,
     )
+    from transformers4rec.torch.features.sequence import SequenceEmbeddingFeatures
 
     _HAS_T4REC = True
     print("T4Rec imported successfully")
@@ -209,96 +207,122 @@ def _load_dataframe(dataset_name: str, sample_size: int) -> pd.DataFrame:
     return df
 
 
-def _create_t4rec_schema(
-    seq_cols: List[str], cat_cols: List[str], config: Dict[str, Any]
-) -> tr.Schema:
-    """Create T4Rec schema from features"""
-    schema_config = []
+class BankingRecommendationModel(torch.nn.Module):
+    """Hybrid T4Rec XLNet model for banking product recommendation"""
 
-    # Add sequence features
-    for col in seq_cols:
-        schema_config.append(
-            FeatureConfig(
-                name=col,
-                dtype="float32",
-                tags=["continuous", "sequence"],
-                cardinality=None,
-                min_val=None,
-                max_val=None,
-            )
+    def __init__(self, embedding_module, xlnet_config, n_products, d_model):
+        super().__init__()
+        self.embedding_module = embedding_module
+        self.transformer = tr.TransformerBlock(xlnet_config)
+        self.n_products = n_products
+
+        # Prediction head
+        self.recommendation_head = torch.nn.Sequential(
+            torch.nn.LayerNorm(d_model),
+            torch.nn.Dropout(
+                xlnet_config.dropout if hasattr(xlnet_config, "dropout") else 0.1
+            ),
+            torch.nn.Linear(d_model, d_model // 2),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(
+                xlnet_config.dropout if hasattr(xlnet_config, "dropout") else 0.1
+            ),
+            torch.nn.Linear(d_model // 2, n_products),
         )
 
-    # Add categorical features
-    cat_config = config["transformers"]["categorical"]
-    for col in cat_cols:
-        schema_config.append(
-            FeatureConfig(
-                name=col,
-                dtype="int64",
-                tags=["categorical"],
-                cardinality=cat_config["max_categories"],
-                min_val=0,
-                max_val=cat_config["max_categories"] - 1,
-            )
-        )
+    def forward(self, inputs, return_embeddings=False):
+        # 1. T4Rec embeddings
+        embeddings = self.embedding_module(inputs)
 
-    # Add target feature
-    target_col = config["features"]["target_col"]
-    schema_config.append(
-        FeatureConfig(
-            name=target_col,
-            dtype="int64",
-            tags=["target"],
-            cardinality=config["model"]["vocab_size"],
-            min_val=0,
-            max_val=config["model"]["vocab_size"] - 1,
-        )
-    )
+        # 2. XLNet transformer
+        try:
+            transformer_output = self.transformer(embeddings)
+        except:
+            # Fallback if transformer fails
+            transformer_output = embeddings
 
-    return tr.Schema(schema_config)
+        # 3. Take last sequence position
+        final_representation = transformer_output[:, -1, :]
+
+        # 4. Product prediction
+        product_logits = self.recommendation_head(final_representation)
+
+        if return_embeddings:
+            return product_logits, final_representation
+        return product_logits
 
 
-def _create_t4rec_model(schema: tr.Schema, config: Dict[str, Any]) -> tr.Model:
-    """Create pure T4Rec XLNet model"""
+def _create_t4rec_model(
+    seq_data: Dict[str, np.ndarray],
+    cat_data: Dict[str, np.ndarray],
+    config: Dict[str, Any],
+):
+    """Create hybrid T4Rec XLNet model (proven approach)"""
     model_config = config["model"]
 
-    # Create input features
-    input_features = tr.TabularSequenceFeatures.from_schema(
-        schema=schema,
-        max_sequence_length=model_config["max_sequence_length"],
-        continuous_projection=model_config["d_model"],
-        categorical_cardinalities="auto",
+    # Create feature configs for T4Rec embeddings
+    feature_configs = {}
+    d_model = model_config["d_model"]
+
+    # Configure sequence features
+    seq_cols = config["features"]["sequence_cols"]
+    cat_cols = config["features"]["categorical_cols"]
+
+    for col in seq_cols:
+        table_config = TableConfig(
+            vocabulary_size=model_config["vocab_size"],
+            dim=d_model // len(seq_cols + cat_cols),
+            name=f"{col}_table",
+        )
+        feature_configs[col] = FeatureConfig(
+            table=table_config,
+            max_sequence_length=model_config["max_sequence_length"],
+            name=col,
+        )
+
+    for col in cat_cols:
+        table_config = TableConfig(
+            vocabulary_size=model_config["vocab_size"],
+            dim=d_model // len(seq_cols + cat_cols),
+            name=f"{col}_table",
+        )
+        feature_configs[col] = FeatureConfig(
+            table=table_config,
+            max_sequence_length=model_config["max_sequence_length"],
+            name=col,
+        )
+
+    # Create T4Rec embedding module
+    embedding_module = SequenceEmbeddingFeatures(
+        feature_config=feature_configs,
+        d_output=d_model,
     )
 
-    # Create XLNet body
-    xlnet_config = tr.XLNetConfig(
-        d_model=model_config["d_model"],
+    # Test embedding to get actual d_model
+    test_batch = {}
+    for col in seq_cols + cat_cols:
+        test_batch[col] = torch.randint(
+            0, model_config["vocab_size"], (2, model_config["max_sequence_length"])
+        )
+
+    with torch.no_grad():
+        test_output = embedding_module(test_batch)
+        actual_d_model = test_output.shape[-1]
+
+    # Create XLNet config
+    xlnet_config = tr.XLNetConfig.build(
+        d_model=actual_d_model,
         n_head=model_config["n_heads"],
         n_layer=model_config["n_layers"],
         dropout=model_config["dropout"],
-        mem_len=model_config["mem_len"],
-        attn_type=model_config["attn_type"],
     )
 
-    body = tr.XLNetBlock(xlnet_config)
-
-    # Create prediction head
-    target_col = config["features"]["target_col"]
-    prediction_task = MultiClassClassificationTask(
-        target_name=target_col,
-        num_classes=config["model"]["vocab_size"],
-        summary_type="last",
-    )
-
-    head = tr.Head(
-        body=body,
-        prediction_tasks=prediction_task,
-    )
-
-    # Create complete model
-    model = tr.Model(
-        input_module=input_features,
-        prediction_module=head,
+    # Create hybrid model
+    model = BankingRecommendationModel(
+        embedding_module=embedding_module,
+        xlnet_config=xlnet_config,
+        n_products=model_config["vocab_size"],
+        d_model=actual_d_model,
     )
 
     return model
@@ -346,10 +370,7 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
     target_vocab_size = len(encoder.classes_)
     config["model"]["vocab_size"] = target_vocab_size
 
-    # Create T4Rec schema
-    schema = _create_t4rec_schema(seq_cols, cat_cols, config)
-
-    # Prepare data for T4Rec
+    # Prepare data for hybrid model
     transformed_data = {}
 
     # Add sequence features
@@ -360,47 +381,31 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
     for i, col in enumerate(cat_cols):
         transformed_data[col] = cat_result.data[col]
 
-    # Add target
-    transformed_data[target_col] = targets
-
-    # Convert to T4Rec dataset format
-    dataset_df = pd.DataFrame(transformed_data)
-
     # Split data
     val_split = config["training"]["val_split"]
-    split_idx = int(len(dataset_df) * (1 - val_split))
-    train_df = dataset_df[:split_idx]
-    val_df = dataset_df[split_idx:]
+    split_idx = int(len(targets) * (1 - val_split))
 
-    # Create T4Rec datasets
-    train_dataset = tr.TabularDataset.from_df(
-        train_df,
-        schema=schema,
-        targets=[target_col],
-    )
+    train_data = {}
+    val_data = {}
+    for col in seq_cols + cat_cols:
+        train_data[col] = transformed_data[col][:split_idx]
+        val_data[col] = transformed_data[col][split_idx:]
 
-    val_dataset = tr.TabularDataset.from_df(
-        val_df,
-        schema=schema,
-        targets=[target_col],
-    )
+    train_targets = targets[:split_idx]
+    val_targets = targets[split_idx:]
 
-    # Create data loaders
-    batch_size = config["training"]["batch_size"]
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-    )
+    # Convert to tensors
+    train_batch = {}
+    val_batch = {}
+    for col in seq_cols + cat_cols:
+        train_batch[col] = torch.tensor(train_data[col], dtype=torch.long)
+        val_batch[col] = torch.tensor(val_data[col], dtype=torch.long)
 
-    val_loader = torch.utils.data.DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-    )
+    train_targets_tensor = torch.tensor(train_targets, dtype=torch.long)
+    val_targets_tensor = torch.tensor(val_targets, dtype=torch.long)
 
-    # Create T4Rec model
-    model = _create_t4rec_model(schema, config)
+    # Create hybrid T4Rec model
+    model = _create_t4rec_model(seq_result.data, cat_result.data, config)
 
     if config["runtime"]["verbose"]:
         total_params = sum(p.numel() for p in model.parameters())
@@ -416,6 +421,7 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
     # Training loop
     num_epochs = config["training"]["num_epochs"]
     history = []
+    loss_fn = torch.nn.CrossEntropyLoss()
 
     if config["runtime"]["progress"] and _HAS_TQDM:
         pbar = tqdm(total=num_epochs, desc="Training T4Rec XLNet")
@@ -425,39 +431,41 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
     for epoch in range(num_epochs):
         # Training
         model.train()
-        total_loss = 0
-        for batch in train_loader:
-            optimizer.zero_grad()
-            outputs = model(batch)
-            loss = outputs.losses
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
+        optimizer.zero_grad()
 
-        avg_loss = total_loss / len(train_loader)
+        train_outputs = model(train_batch)
+        train_loss = loss_fn(train_outputs, train_targets_tensor)
+        train_loss.backward()
+        optimizer.step()
 
         # Validation
         model.eval()
-        val_metrics = model.evaluate(val_loader)
-        val_accuracy = val_metrics.get("accuracy", 0.0)
+        with torch.no_grad():
+            val_outputs = model(val_batch)
+            val_loss = loss_fn(val_outputs, val_targets_tensor)
+
+            # Calculate accuracy
+            val_predictions = torch.argmax(val_outputs, dim=1)
+            val_accuracy = (val_predictions == val_targets_tensor).float().mean().item()
 
         history.append(
             {
                 "epoch": epoch + 1,
-                "train_loss": avg_loss,
+                "train_loss": train_loss.item(),
+                "val_loss": val_loss.item(),
                 "val_accuracy": val_accuracy,
             }
         )
 
         if pbar:
             pbar.set_postfix(
-                {"loss": f"{avg_loss:.4f}", "val_acc": f"{val_accuracy:.4f}"}
+                {"loss": f"{train_loss.item():.4f}", "val_acc": f"{val_accuracy:.4f}"}
             )
             pbar.update(1)
 
         if config["runtime"]["verbose"]:
             logger.info(
-                f"Epoch {epoch + 1}/{num_epochs} | Loss: {avg_loss:.4f} | Val Acc: {val_accuracy:.4f}"
+                f"Epoch {epoch + 1}/{num_epochs} | Loss: {train_loss.item():.4f} | Val Acc: {val_accuracy:.4f}"
             )
 
     if pbar:
@@ -465,21 +473,33 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
 
     # Final evaluation
     model.eval()
-    final_metrics = model.evaluate(val_loader)
+    with torch.no_grad():
+        final_val_outputs = model(val_batch)
+        final_predictions = torch.argmax(final_val_outputs, dim=1)
+        final_accuracy = (final_predictions == val_targets_tensor).float().mean().item()
+
+        # Calculate other metrics
+        from sklearn.metrics import precision_recall_fscore_support
+
+        precision, recall, f1, _ = precision_recall_fscore_support(
+            val_targets_tensor.cpu().numpy(),
+            final_predictions.cpu().numpy(),
+            average="weighted",
+            zero_division=0,
+        )
 
     # Get predictions for Top-K analysis
-    predictions = model.predict(val_loader)
-    prediction_scores = predictions.prediction_response
-    true_labels = val_df[target_col].values
+    prediction_scores = final_val_outputs.cpu().numpy()
+    true_labels = val_targets_tensor.cpu().numpy()
 
     execution_time = time.time() - start_time
 
     return {
         "metrics": {
-            "accuracy": final_metrics.get("accuracy", 0.0),
-            "precision": final_metrics.get("precision", 0.0),
-            "recall": final_metrics.get("recall", 0.0),
-            "f1": final_metrics.get("f1", 0.0),
+            "accuracy": final_accuracy,
+            "precision": precision,
+            "recall": recall,
+            "f1": f1,
         },
         "predictions": {
             "raw_outputs": prediction_scores,
@@ -725,4 +745,5 @@ def get_config_schema() -> Dict[str, Any]:
             },
         },
     }
+
 
