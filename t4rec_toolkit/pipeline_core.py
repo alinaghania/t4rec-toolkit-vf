@@ -17,9 +17,8 @@ import pandas as pd
 try:
     import transformers4rec.torch as tr
     from transformers4rec.torch.ranking_metric import NDCGAt, RecallAt
-    from transformers4rec.torch.features.embedding import EmbeddingFeatures
+    from transformers4rec.torch.features.embedding import EmbeddingFeatures, FeatureConfig, TableConfig
     from transformers4rec.torch.features.sequence import SequenceEmbeddingFeatures
-    from transformers4rec.torch.features.tabular import FeatureConfig, TableConfig
     from transformers4rec.torch.model.head import Head
     from transformers4rec.torch.model.prediction_task import (
         RegressionTask,
@@ -726,5 +725,4 @@ def get_config_schema() -> Dict[str, Any]:
             },
         },
     }
-
 
