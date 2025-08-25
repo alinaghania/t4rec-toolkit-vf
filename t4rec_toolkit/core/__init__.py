@@ -14,9 +14,21 @@ from .config_manager import (
     get_config_schema,
     print_config_help,
 )
-from .training_engine import TrainingEngine
 
-__all__ = [
+# Conditional import for TrainingEngine (requires torch)
+try:
+    from .training_engine import TrainingEngine
+
+    _HAS_TRAINING_ENGINE = True
+except ImportError as e:
+    TrainingEngine = None
+    _HAS_TRAINING_ENGINE = False
+    import warnings
+
+    warnings.warn(f"TrainingEngine not available: {e}", ImportWarning)
+
+# Base exports (always available)
+_base_exports = [
     "BaseTransformer",
     "TransformationResult",
     "DataValidator",
@@ -32,5 +44,7 @@ __all__ = [
     "validate_config",
     "get_config_schema",
     "print_config_help",
-    "TrainingEngine",
 ]
+
+# Add TrainingEngine if available
+__all__ = _base_exports + (["TrainingEngine"] if _HAS_TRAINING_ENGINE else [])
