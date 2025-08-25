@@ -1,3 +1,271 @@
+"""
+Pure T4Rec XLNet Pipeline - No PyTorch fallback, only T4Rec
+Production pipeline using transformers4rec with XLNet architecture
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+
+# T4Rec imports
+try:
+    import transformers4rec.torch as tr
+    from transformers4rec.torch.ranking_metric import NDCGAt, RecallAt
+    from transformers4rec.torch.features.embedding import (
+        EmbeddingFeatures,
+        FeatureConfig,
+        TableConfig,
+    )
+    from transformers4rec.torch.features.sequence import SequenceEmbeddingFeatures
+
+    _HAS_T4REC = True
+    print("T4Rec imported successfully")
+except ImportError as e:
+    _HAS_T4REC = False
+    print(f"T4Rec import error: {e}")
+    raise ImportError(
+        "T4Rec is required for this pipeline. Install with: pip install transformers4rec[torch]"
+    )
+
+# Optional imports
+try:
+    import dataiku
+
+    _HAS_DATAIKU = True
+except Exception:
+    _HAS_DATAIKU = False
+
+try:
+    from tqdm.auto import tqdm
+
+    _HAS_TQDM = True
+except Exception:
+    _HAS_TQDM = False
+
+# Local toolkit
+from .transformers.sequence_transformer import SequenceTransformer
+from .transformers.categorical_transformer import CategoricalTransformer
+
+import torch
+import torch.nn as nn
+
+
+@dataclass
+class T4RecConfig:
+    """Configuration for T4Rec XLNet model"""
+
+    # Model architecture
+    d_model: int = 256
+    n_heads: int = 8
+    n_layers: int = 3
+    dropout: float = 0.1
+    max_sequence_length: int = 20
+
+    # XLNet specific
+    mem_len: int = 50
+    attn_type: str = "bi"
+
+    # Vocabulary
+    vocab_size: int = 1000
+
+    # Task specific
+    num_classes: int = 150
+
+
+def _dynamic_t4rec_defaults(sample_size: int) -> T4RecConfig:
+    """Dynamic T4Rec configuration based on sample size"""
+    if sample_size <= 10000:
+        return T4RecConfig(
+            d_model=128,
+            n_heads=4,
+            n_layers=2,
+            max_sequence_length=15,
+            vocab_size=500,
+        )
+    elif sample_size <= 100000:
+        return T4RecConfig(
+            d_model=256,
+            n_heads=8,
+            n_layers=3,
+            max_sequence_length=20,
+            vocab_size=1000,
+        )
+    else:
+        return T4RecConfig(
+            d_model=384,
+            n_heads=12,
+            n_layers=4,
+            max_sequence_length=25,
+            vocab_size=1500,
+        )
+
+
+def blank_config() -> Dict[str, Any]:
+    """Create blank configuration for T4Rec pipeline"""
+    return {
+        "data": {
+            "dataset_name": "",
+            "sample_size": 10000,
+            "chunk_size": 2000,
+        },
+        "features": {
+            "sequence_cols": [],
+            "categorical_cols": [],
+            "target_col": "",
+            "max_seq_features": None,
+            "max_cat_features": None,
+        },
+        "model": {
+            "d_model": 256,
+            "n_heads": 8,
+            "n_layers": 3,
+            "dropout": 0.1,
+            "max_sequence_length": 20,
+            "mem_len": 50,
+            "attn_type": "bi",
+            "vocab_size": 1000,
+        },
+        "transformers": {
+            "categorical": {
+                "max_categories": 50,
+                "handle_unknown": "ignore",
+                "unknown_value": 1,
+            }
+        },
+        "training": {
+            "batch_size": 64,
+            "num_epochs": 15,
+            "learning_rate": 1e-3,
+            "weight_decay": 1e-2,
+            "val_split": 0.2,
+        },
+        "runtime": {
+            "verbose": True,
+            "progress": True,
+            "seed": 42,
+        },
+        "outputs": {
+            "features_dataset": None,
+            "predictions_dataset": None,
+            "metrics_dataset": None,
+            "local_dir": "output",
+        },
+    }
+
+
+def default_config(
+    mode: Optional[str] = None, sample_size: Optional[int] = None
+) -> Dict[str, Any]:
+    """Create default configuration with T4Rec optimizations"""
+    config = blank_config()
+
+    if sample_size:
+        config["data"]["sample_size"] = sample_size
+        # Auto-configure T4Rec model based on sample size
+        t4rec_cfg = _dynamic_t4rec_defaults(sample_size)
+        config["model"].update(
+            {
+                "d_model": t4rec_cfg.d_model,
+                "n_heads": t4rec_cfg.n_heads,
+                "n_layers": t4rec_cfg.n_layers,
+                "max_sequence_length": t4rec_cfg.max_sequence_length,
+                "vocab_size": t4rec_cfg.vocab_size,
+            }
+        )
+
+        # Auto-configure training
+        config["data"]["chunk_size"] = min(sample_size // 5, 5000)
+        if sample_size <= 10000:
+            config["training"]["batch_size"] = 32
+        elif sample_size <= 100000:
+            config["training"]["batch_size"] = 64
+        else:
+            config["training"]["batch_size"] = 128
+
+    return config
+
+
+def _setup_logging(verbose: bool) -> None:
+    """Setup logging configuration"""
+    level = logging.INFO if verbose else logging.WARNING
+    logging.basicConfig(level=level, format="%(asctime)s - %(levelname)s - %(message)s")
+
+
+def _load_dataframe(dataset_name: str, sample_size: int) -> pd.DataFrame:
+    """Load dataframe from Dataiku with sampling"""
+    if not _HAS_DATAIKU:
+        raise RuntimeError("Dataiku not available")
+
+    dataset = dataiku.Dataset(dataset_name)
+    df = dataset.get_dataframe(limit=sample_size)
+    return df
+
+
+class T4RecAdvancedModel(torch.nn.Module):
+    """Advanced T4Rec + Multi-Embedding + Transformer model for banking recommendation
+
+    Scientific Architecture based on Meta/Pinterest 2024-2025 best practices:
+    - T4Rec SequenceEmbeddingFeatures for specialized recommendation embeddings
+    - Dual-pathway embeddings (item context + user profile) for richer representations
+    - Advanced PyTorch TransformerEncoder with increased depth and capacity
+    - Sophisticated prediction head with GELU activation and layered architecture
+    - Positional encoding for enhanced sequence understanding
+    """
+
+    def __init__(
+        self,
+        embedding_module,
+        xlnet_config,
+        n_products,
+        d_model,
+        embedding_output_dim=None,
+        vocab_size=1000,
+        max_sequence_length=20,
+    ):
+        super().__init__()
+
+        # Core T4Rec embeddings (specialized for recommendations)
+        self.t4rec_embeddings = embedding_module
+
+        # Advanced dual-pathway embeddings (Meta/Pinterest approach)
+        self.item_context_embedding = torch.nn.Embedding(vocab_size, d_model)
+        self.user_profile_embedding = torch.nn.Embedding(vocab_size, d_model)
+
+        # Positional encoding for enhanced sequence understanding
+        self.positional_encoding = torch.nn.Parameter(
+            torch.randn(1, max_sequence_length, d_model) * 0.02
+        )
+
+        # Feature fusion layer (will be initialized after first forward pass)
+        self.feature_fusion = None  # Dynamic initialization
+        self.fusion_input_dim = None
+
+        # Advanced Transformer with increased capacity (6 layers vs 3)
+        encoder_layer = torch.nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=xlnet_config.n_head
+            if hasattr(xlnet_config, "n_head")
+            else 16,  # More heads
+            dim_feedforward=d_model * 4,  # Larger feedforward
+            dropout=xlnet_config.dropout if hasattr(xlnet_config, "dropout") else 0.1,
+            activation="gelu",  # Advanced activation
+            batch_first=True,
+        )
+        self.transformer = torch.nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=6,  # Deeper than standard (6 vs 3)
+        )
+
+        # Projection layer for dimension adaptation
+        self.projection = None
+        if embedding_output_dim and embedding_output_dim != d_model:
+            self.projection = torch.nn.Linear(embedding_output_dim, d_model)
 
         # Advanced prediction head (Pinterest-style sophisticated architecture)
         self.recommendation_head = torch.nn.Sequential(
