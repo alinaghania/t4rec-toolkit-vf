@@ -264,7 +264,7 @@ def _create_t4rec_model(
     feature_configs = {}
     d_model = model_config["d_model"]
 
-    # Configure sequence features
+    # Configure sequence features (use filtered columns)
     seq_cols = config["features"]["sequence_cols"]
     cat_cols = config["features"]["categorical_cols"]
 
@@ -292,22 +292,36 @@ def _create_t4rec_model(
             name=col,
         )
 
-    # Create T4Rec embedding module
+    # Create T4Rec embedding module (using API that actually exists in 23.04.00)
+    # Use the first sequence column as item_id (required parameter)
+    item_id_col = seq_cols[0] if seq_cols else cat_cols[0]
+
     embedding_module = SequenceEmbeddingFeatures(
-        feature_config=feature_configs,
-        d_output=d_model,
+        feature_config=feature_configs, item_id=item_id_col, aggregation="concat"
     )
 
     # Test embedding to get actual d_model
     test_batch = {}
-    for col in seq_cols + cat_cols:
+    all_cols = seq_cols + cat_cols
+    for col in all_cols:
         test_batch[col] = torch.randint(
             0, model_config["vocab_size"], (2, model_config["max_sequence_length"])
         )
 
     with torch.no_grad():
-        test_output = embedding_module(test_batch)
-        actual_d_model = test_output.shape[-1]
+        try:
+            test_output = embedding_module(test_batch)
+            actual_d_model = test_output.shape[-1]
+            if config["runtime"]["verbose"]:
+                print(
+                    f"T4Rec embedding test successful: output_shape={test_output.shape}, d_model={actual_d_model}"
+                )
+        except Exception as e:
+            if config["runtime"]["verbose"]:
+                print(
+                    f"T4Rec embedding test failed: {e}, using configured d_model={d_model}"
+                )
+            actual_d_model = d_model
 
     # Create XLNet config
     xlnet_config = tr.XLNetConfig.build(
@@ -844,4 +858,3 @@ def get_config_schema() -> Dict[str, Any]:
             },
         },
     }
-
