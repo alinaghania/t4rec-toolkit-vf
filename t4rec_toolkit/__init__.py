@@ -8,12 +8,22 @@ from .core import (
     TransformationResult,
     DataValidator,
     ValidationResult,
+    SequenceValidator,
     T4RecToolkitError,
     DataValidationError,
     TransformationError,
     SchemaError,
     ConfigurationError,
+    blank_config,
+    default_config,
+    validate_config,
+    get_config_schema,
+    print_config_help,
+    TrainingEngine,
 )
+
+# Pipeline orchestrator
+from .pipeline_core import run_training
 
 # Transformers
 from .transformers import (
@@ -22,12 +32,13 @@ from .transformers import (
     NumericalTransformer,
 )
 
-# Model builders
+# Model builders and advanced models
 from .models import (
     ModelRegistry,
     BaseModelBuilder,
     XLNetModelBuilder,
     GPT2ModelBuilder,
+    T4RecAdvancedModel,
     get_available_models,
     create_model,
     registry,
@@ -35,6 +46,19 @@ from .models import (
 
 # Adapters
 from .adapters import T4RecAdapter, DataikuAdapter
+
+# Utils
+from .utils import (
+    save_model,
+    load_model,
+    save_config,
+    load_config,
+    merge_configs,
+    validate_config_schema,
+    get_default_training_args,
+    adapt_config_to_environment,
+    select_features_for_t4rec,
+)
 
 __version__ = "0.1.0"
 
@@ -44,11 +68,20 @@ __all__ = [
     "TransformationResult",
     "DataValidator",
     "ValidationResult",
+    "SequenceValidator",
     "T4RecToolkitError",
     "DataValidationError",
     "TransformationError",
     "SchemaError",
     "ConfigurationError",
+    # Configuration & Training
+    "blank_config",
+    "default_config",
+    "validate_config",
+    "get_config_schema",
+    "print_config_help",
+    "TrainingEngine",
+    "run_training",
     # Transformers
     "SequenceTransformer",
     "CategoricalTransformer",
@@ -58,10 +91,22 @@ __all__ = [
     "BaseModelBuilder",
     "XLNetModelBuilder",
     "GPT2ModelBuilder",
+    "T4RecAdvancedModel",
     "get_available_models",
     "create_model",
     "registry",
     # Adapters
     "T4RecAdapter",
     "DataikuAdapter",
+    # Utils
+    "save_model",
+    "load_model",
+    "save_config",
+    "load_config",
+    "merge_configs",
+    "validate_config_schema",
+    "get_default_training_args",
+    "adapt_config_to_environment",
+    "select_features_for_t4rec",
 ]
+
