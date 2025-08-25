@@ -589,12 +589,17 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
 
     model.eval()
     all_pred: List[int] = []
+    all_outputs: List[np.ndarray] = []  # Store full prediction logits for Top-K
     bs = int(trn["batch_size"])
     with torch.no_grad():
         for i in range(0, len(val_items), bs):
             b_items = val_items[i : i + bs]
             b_users = val_users[i : i + bs]
             outputs = model(b_items, b_users)
+
+            # Store full outputs for Top-K calculation
+            all_outputs.extend(outputs.cpu().numpy())
+
             _, pred = torch.max(outputs, 1)
             all_pred.extend(pred.cpu().numpy())
 
@@ -751,6 +756,11 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
             "f1": f1,
             "val_samples": int(len(val_items)),
         },
+        "predictions": {
+            "raw_outputs": np.array(all_outputs),  # Full logits for Top-K
+            "predicted_classes": np.array(all_pred),
+            "true_classes": np.array(all_true),
+        },
         "artifacts": {
             "features": df_features,
             "predictions": df_predictions,
@@ -758,6 +768,7 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
         },
         "model_info": {
             "total_params": int(total_params),
+            "parameters": int(total_params),  # Add alias for compatibility
             "architecture": f"{model_cfg['num_layers']}L-{model_cfg['num_heads']}H-{model_cfg['embedding_dim']}D",
         },
         "data_info": {
@@ -768,6 +779,7 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
             "chunk_size": chunk_size,
         },
         "timing": {"total_seconds": total_time},
+        "execution_time": total_time,  # Add alias for compatibility
     }
 
 
@@ -1181,15 +1193,11 @@ def evaluate_topk_metrics(predictions=None, targets=None, k_values=[1, 3, 4]):
         Dict with metrics by K value
     """
     if predictions is None or targets is None:
-        # Simulate realistic metrics based on banking recommendation context
-        metrics_by_k = {
-            1: {"precision": 0.543, "recall": 0.538, "f1_score": 0.540},
-            3: {"precision": 0.274, "recall": 0.807, "f1_score": 0.409},
-            4: {"precision": 0.225, "recall": 0.883, "f1_score": 0.360},
-        }
-        return {k: metrics_by_k[k] for k in k_values if k in metrics_by_k}
+        raise ValueError(
+            "Real predictions and targets are required. No simulation allowed."
+        )
 
-    # Real computation if data available
+    # Real computation with actual model predictions
     metrics_by_k = {}
 
     for k in k_values:
@@ -1197,12 +1205,10 @@ def evaluate_topk_metrics(predictions=None, targets=None, k_values=[1, 3, 4]):
         recalls = []
         f1_scores = []
 
-        for pred, target in zip(predictions, targets):
-            # Get top-K predictions
-            if hasattr(pred, "argsort"):
-                top_k_preds = set(pred.argsort()[-k:][::-1])
-            else:
-                top_k_preds = set(range(k))
+        for pred_logits, target in zip(predictions, targets):
+            # Get top-K predictions from logits
+            top_k_indices = np.argsort(pred_logits)[-k:][::-1]  # Top-K highest logits
+            top_k_preds = set(top_k_indices)
 
             target_set = {target}
             intersection = top_k_preds.intersection(target_set)
