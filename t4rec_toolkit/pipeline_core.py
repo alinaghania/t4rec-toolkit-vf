@@ -373,13 +373,40 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
     # Prepare data for hybrid model
     transformed_data = {}
 
-    # Add sequence features
-    for i, col in enumerate(seq_cols):
-        transformed_data[col] = seq_result.data[col]
+    # Debug: Check what keys are available
+    if config["runtime"]["verbose"]:
+        logger.info(f"Sequence result keys: {list(seq_result.data.keys())}")
+        logger.info(f"Categorical result keys: {list(cat_result.data.keys())}")
+        logger.info(f"Expected sequence cols: {seq_cols}")
+        logger.info(f"Expected categorical cols: {cat_cols}")
 
-    # Add categorical features
-    for i, col in enumerate(cat_cols):
-        transformed_data[col] = cat_result.data[col]
+    # Add sequence features (transformers create "{col}_seq" keys)
+    for col in seq_cols:
+        seq_key = f"{col}_seq"
+        if seq_key in seq_result.data:
+            transformed_data[col] = seq_result.data[seq_key]
+            if config["runtime"]["verbose"]:
+                logger.info(
+                    f"Mapped sequence column {col} to transformer key {seq_key}"
+                )
+        else:
+            raise KeyError(
+                f"Cannot find sequence transformer key {seq_key} for column {col}"
+            )
+
+    # Add categorical features (transformers create "{col}_encoded" keys)
+    for col in cat_cols:
+        cat_key = f"{col}_encoded"
+        if cat_key in cat_result.data:
+            transformed_data[col] = cat_result.data[cat_key]
+            if config["runtime"]["verbose"]:
+                logger.info(
+                    f"Mapped categorical column {col} to transformer key {cat_key}"
+                )
+        else:
+            raise KeyError(
+                f"Cannot find categorical transformer key {cat_key} for column {col}"
+            )
 
     # Split data
     val_split = config["training"]["val_split"]
@@ -745,5 +772,4 @@ def get_config_schema() -> Dict[str, Any]:
             },
         },
     }
-
 
