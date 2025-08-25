@@ -372,7 +372,9 @@ def _create_t4rec_model(
     model = BankingRecommendationModel(
         embedding_module=embedding_module,
         xlnet_config=xlnet_config,
-        n_products=model_config["vocab_size"],
+        n_products=model_config[
+            "target_vocab_size"
+        ],  # Use target classes for prediction head
         d_model=actual_d_model,
         embedding_output_dim=embedding_output_dim,
     )
@@ -460,7 +462,15 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
     encoder = LabelEncoder()
     targets = encoder.fit_transform(df[target_col])
     target_vocab_size = len(encoder.classes_)
-    config["model"]["vocab_size"] = target_vocab_size
+
+    # Keep original vocab_size for embeddings, store target_vocab_size separately
+    config["model"]["target_vocab_size"] = target_vocab_size
+    # Ensure vocab_size is large enough for both features and target
+    if "vocab_size" not in config["model"]:
+        config["model"]["vocab_size"] = 1000  # Default
+    config["model"]["vocab_size"] = max(
+        config["model"]["vocab_size"], target_vocab_size + 100
+    )
 
     # Prepare data for hybrid model
     transformed_data = {}
@@ -530,23 +540,35 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
         )
 
         # Convert to proper format for T4Rec embeddings
-        # All features need to be integers for embedding layers
+        # All features need to be integers for embedding layers within vocab_size
+        vocab_size = config["model"]["vocab_size"]
+
         if col in seq_cols_filtered:
-            # For sequence features, discretize float values to integers
-            train_values_int = (train_values * 1000).astype(
-                int
-            )  # Scale and convert to int
-            val_values_int = (val_values * 1000).astype(int)
+            # For sequence features, discretize float values to integers within vocab range
+            train_values_int = np.clip(
+                (train_values * (vocab_size - 1)).astype(int), 0, vocab_size - 1
+            )
+            val_values_int = np.clip(
+                (val_values * (vocab_size - 1)).astype(int), 0, vocab_size - 1
+            )
             train_batch[col] = torch.tensor(train_values_int, dtype=torch.long)
             val_batch[col] = torch.tensor(val_values_int, dtype=torch.long)
         else:  # categorical
-            train_batch[col] = torch.tensor(train_values.astype(int), dtype=torch.long)
-            val_batch[col] = torch.tensor(val_values.astype(int), dtype=torch.long)
+            # For categorical features, ensure they're within vocab range
+            train_values_int = np.clip(train_values.astype(int), 0, vocab_size - 1)
+            val_values_int = np.clip(val_values.astype(int), 0, vocab_size - 1)
+            train_batch[col] = torch.tensor(train_values_int, dtype=torch.long)
+            val_batch[col] = torch.tensor(val_values_int, dtype=torch.long)
 
         if config["runtime"]["verbose"]:
-            logger.info(
-                f"Converted {col}: train_shape={train_values.shape}, val_shape={val_values.shape}"
-            )
+            if col in seq_cols_filtered:
+                logger.info(
+                    f"Sequence {col}: train_range=[{train_values_int.min()}, {train_values_int.max()}], vocab_size={vocab_size}"
+                )
+            else:
+                logger.info(
+                    f"Categorical {col}: train_range=[{train_values_int.min()}, {train_values_int.max()}], vocab_size={vocab_size}"
+                )
 
     train_targets_tensor = torch.tensor(train_targets, dtype=torch.long)
     val_targets_tensor = torch.tensor(val_targets, dtype=torch.long)
