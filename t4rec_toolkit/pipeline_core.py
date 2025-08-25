@@ -208,7 +208,13 @@ def _load_dataframe(dataset_name: str, sample_size: int) -> pd.DataFrame:
 
 
 class BankingRecommendationModel(torch.nn.Module):
-    """Hybrid T4Rec XLNet model for banking product recommendation"""
+    """Hybrid T4Rec + PyTorch Transformer model for banking product recommendation
+
+    Architecture:
+    - T4Rec SequenceEmbeddingFeatures for optimized recommendation embeddings
+    - PyTorch TransformerEncoder for stable sequence processing
+    - PyTorch prediction head for banking product classification
+    """
 
     def __init__(
         self,
@@ -220,7 +226,19 @@ class BankingRecommendationModel(torch.nn.Module):
     ):
         super().__init__()
         self.embedding_module = embedding_module
-        self.transformer = tr.TransformerBlock(xlnet_config)
+
+        # Use PyTorch TransformerEncoder instead of tr.TransformerBlock for stability
+        encoder_layer = torch.nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=xlnet_config.n_head if hasattr(xlnet_config, "n_head") else 8,
+            dim_feedforward=d_model * 4,
+            dropout=xlnet_config.dropout if hasattr(xlnet_config, "dropout") else 0.1,
+            batch_first=True,
+        )
+        self.transformer = torch.nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=xlnet_config.n_layer if hasattr(xlnet_config, "n_layer") else 3,
+        )
         self.n_products = n_products
 
         # Add projection layer if embedding output doesn't match XLNet d_model
@@ -250,15 +268,16 @@ class BankingRecommendationModel(torch.nn.Module):
         if self.projection is not None:
             embeddings = self.projection(embeddings)
 
-        # 3. XLNet transformer
+        # 3. PyTorch TransformerEncoder (stable & preserves sequence dimension)
         try:
-            transformer_output = self.transformer(embeddings)
-        except:
+            transformer_output = self.transformer(embeddings)  # [batch, seq, features]
+        except Exception as e:
             # Fallback if transformer fails
+            print(f"DEBUG: Transformer failed: {e}, using embeddings fallback")
             transformer_output = embeddings
 
-        # 3. Take last sequence position
-        final_representation = transformer_output[:, -1, :]
+        # 4. Take last sequence position (PyTorch TransformerEncoder preserves dims)
+        final_representation = transformer_output[:, -1, :]  # [batch, features]
 
         # 4. Product prediction
         product_logits = self.recommendation_head(final_representation)
@@ -348,7 +367,7 @@ def _create_t4rec_model(
 
             if config["runtime"]["verbose"]:
                 print(
-                    f"T4Rec embedding: {detected_d_model}D → XLNet: {actual_d_model}D (projection: {detected_d_model != actual_d_model})"
+                    f"T4Rec embedding: {detected_d_model}D → Transformer: {actual_d_model}D (projection: {detected_d_model != actual_d_model})"
                 )
         except Exception as e:
             if config["runtime"]["verbose"]:
@@ -360,7 +379,7 @@ def _create_t4rec_model(
             n_heads = model_config["n_heads"]
             actual_d_model = (d_model // n_heads) * n_heads
 
-    # Create XLNet config
+    # Create transformer config (will be adapted for PyTorch TransformerEncoder)
     xlnet_config = tr.XLNetConfig.build(
         d_model=actual_d_model,
         n_head=model_config["n_heads"],
