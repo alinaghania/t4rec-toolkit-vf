@@ -355,12 +355,37 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
     cat_cols = config["features"]["categorical_cols"]
     target_col = config["features"]["target_col"]
 
+    # Verify columns exist in dataframe
+    available_cols = set(df.columns)
+    missing_seq = [col for col in seq_cols if col not in available_cols]
+    missing_cat = [col for col in cat_cols if col not in available_cols]
+
+    if missing_seq or missing_cat:
+        if config["runtime"]["verbose"]:
+            logger.error(f"Missing sequence columns: {missing_seq}")
+            logger.error(f"Missing categorical columns: {missing_cat}")
+            logger.info(f"Available columns sample: {list(df.columns)[:20]}...")
+        raise ValueError(f"Missing columns - Seq: {missing_seq}, Cat: {missing_cat}")
+
+    # Filter to existing columns only
+    seq_cols_filtered = [col for col in seq_cols if col in available_cols]
+    cat_cols_filtered = [col for col in cat_cols if col in available_cols]
+
+    if config["runtime"]["verbose"]:
+        logger.info(
+            f"Using {len(seq_cols_filtered)} sequence and {len(cat_cols_filtered)} categorical columns"
+        )
+
     # Transform features
     seq_transformer = SequenceTransformer()
     cat_transformer = CategoricalTransformer()
 
-    seq_result = seq_transformer.fit(df[seq_cols]).transform(df[seq_cols])
-    cat_result = cat_transformer.fit(df[cat_cols]).transform(df[cat_cols])
+    seq_result = seq_transformer.fit(df[seq_cols_filtered]).transform(
+        df[seq_cols_filtered]
+    )
+    cat_result = cat_transformer.fit(df[cat_cols_filtered]).transform(
+        df[cat_cols_filtered]
+    )
 
     # Prepare target
     from sklearn.preprocessing import LabelEncoder
@@ -381,7 +406,7 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
         logger.info(f"Expected categorical cols: {cat_cols}")
 
     # Add sequence features (transformers create "{col}_seq" keys)
-    for col in seq_cols:
+    for col in seq_cols_filtered:
         seq_key = f"{col}_seq"
         if seq_key in seq_result.data:
             transformed_data[col] = seq_result.data[seq_key]
@@ -395,7 +420,7 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
             )
 
     # Add categorical features (transformers create "{col}_encoded" keys)
-    for col in cat_cols:
+    for col in cat_cols_filtered:
         cat_key = f"{col}_encoded"
         if cat_key in cat_result.data:
             transformed_data[col] = cat_result.data[cat_key]
@@ -430,6 +455,10 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
 
     train_targets_tensor = torch.tensor(train_targets, dtype=torch.long)
     val_targets_tensor = torch.tensor(val_targets, dtype=torch.long)
+
+    # Update config with filtered columns for model creation
+    config["features"]["sequence_cols"] = seq_cols_filtered
+    config["features"]["categorical_cols"] = cat_cols_filtered
 
     # Create hybrid T4Rec model
     model = _create_t4rec_model(seq_result.data, cat_result.data, config)
