@@ -19,11 +19,25 @@ from .core import (
     validate_config,
     get_config_schema,
     print_config_help,
-    TrainingEngine,
 )
 
-# Pipeline orchestrator
-from .pipeline_core import run_training
+# Conditional imports (require torch/T4Rec)
+try:
+    from .core import TrainingEngine
+
+    _HAS_TRAINING_ENGINE = True
+except ImportError:
+    TrainingEngine = None
+    _HAS_TRAINING_ENGINE = False
+
+# Pipeline orchestrator (conditional)
+try:
+    from .pipeline_core import run_training
+
+    _HAS_PIPELINE = True
+except ImportError:
+    run_training = None
+    _HAS_PIPELINE = False
 
 # Transformers
 from .transformers import (
@@ -62,7 +76,8 @@ from .utils import (
 
 __version__ = "0.1.0"
 
-__all__ = [
+# Base exports (always available)
+_base_exports = [
     # Core
     "BaseTransformer",
     "TransformationResult",
@@ -74,14 +89,12 @@ __all__ = [
     "TransformationError",
     "SchemaError",
     "ConfigurationError",
-    # Configuration & Training
+    # Configuration
     "blank_config",
     "default_config",
     "validate_config",
     "get_config_schema",
     "print_config_help",
-    "TrainingEngine",
-    "run_training",
     # Transformers
     "SequenceTransformer",
     "CategoricalTransformer",
@@ -110,3 +123,11 @@ __all__ = [
     "select_features_for_t4rec",
 ]
 
+# Conditional exports (require torch/T4Rec)
+_conditional_exports = []
+if _HAS_TRAINING_ENGINE:
+    _conditional_exports.append("TrainingEngine")
+if _HAS_PIPELINE:
+    _conditional_exports.append("run_training")
+
+__all__ = _base_exports + _conditional_exports
