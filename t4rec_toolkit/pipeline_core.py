@@ -263,21 +263,40 @@ class BankingRecommendationModel(torch.nn.Module):
     def forward(self, inputs, return_embeddings=False):
         # 1. T4Rec embeddings
         embeddings = self.embedding_module(inputs)
+        print(f"DEBUG: T4Rec embeddings shape: {embeddings.shape}")
 
         # 2. Project to correct dimensions if needed
         if self.projection is not None:
             embeddings = self.projection(embeddings)
+            print(f"DEBUG: After projection shape: {embeddings.shape}")
 
-        # 3. PyTorch TransformerEncoder (stable & preserves sequence dimension)
+        # 3. Handle T4Rec embeddings that might be 2D instead of 3D
+        if len(embeddings.shape) == 2:
+            # T4Rec collapsed the sequence, add sequence dimension back
+            batch_size, features = embeddings.shape
+            embeddings = embeddings.unsqueeze(1)  # [batch, 1, features]
+            print(f"DEBUG: Added sequence dimension: {embeddings.shape}")
+
+        # 4. PyTorch TransformerEncoder (stable & preserves sequence dimension)
         try:
             transformer_output = self.transformer(embeddings)  # [batch, seq, features]
+            print(f"DEBUG: Transformer output shape: {transformer_output.shape}")
         except Exception as e:
             # Fallback if transformer fails
             print(f"DEBUG: Transformer failed: {e}, using embeddings fallback")
             transformer_output = embeddings
 
-        # 4. Take last sequence position (PyTorch TransformerEncoder preserves dims)
-        final_representation = transformer_output[:, -1, :]  # [batch, features]
+        # 5. Take last sequence position (handle both 2D and 3D cases)
+        if len(transformer_output.shape) == 3:
+            final_representation = transformer_output[:, -1, :]  # [batch, features]
+        elif len(transformer_output.shape) == 2:
+            final_representation = transformer_output  # Already [batch, features]
+        else:
+            raise ValueError(
+                f"Unexpected transformer output shape: {transformer_output.shape}"
+            )
+
+        print(f"DEBUG: Final representation shape: {final_representation.shape}")
 
         # 4. Product prediction
         product_logits = self.recommendation_head(final_representation)
