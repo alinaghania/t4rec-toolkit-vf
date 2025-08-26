@@ -113,6 +113,8 @@ def blank_config() -> Dict[str, Any]:
             "dataset_name": "",
             "sample_size": 10000,
             "chunk_size": 2000,
+            "partitions": None,
+            "temporal_split": None,
         },
         "features": {
             "sequence_cols": [],
@@ -197,14 +199,120 @@ def _setup_logging(verbose: bool) -> None:
     logging.basicConfig(level=level, format="%(asctime)s - %(levelname)s - %(message)s")
 
 
-def _load_dataframe(dataset_name: str, sample_size: int) -> pd.DataFrame:
-    """Load dataframe from Dataiku with sampling"""
-    if not _HAS_DATAIKU:
-        raise RuntimeError("Dataiku not available")
+def _load_dataframe(
+    dataset_name: str,
+    sample_size: int,
+    partitions: List[str] = None,
+    temporal_split: Dict[str, Any] = None,
+) -> Tuple[pd.DataFrame, Optional[pd.DataFrame]]:
+    """
+    Load DataFrame from Dataiku with temporal split support
 
-    dataset = dataiku.Dataset(dataset_name)
-    df = dataset.get_dataframe(limit=sample_size)
-    return df
+    Returns:
+        Tuple[train_df, test_df]: Training data and optional test data
+    """
+    logger = logging.getLogger(__name__)
+
+    if not _HAS_DATAIKU:
+        raise RuntimeError("Dataiku not available - temporal split requires Dataiku")
+
+    try:
+        from .adapters.dataiku_adapter import load_dataset
+
+        # Si temporal_split est défini, charger train et test séparément
+        if temporal_split:
+            logger.info(f"Loading temporal split: {temporal_split}")
+
+            # Construire les partitions d'entraînement
+            train_start = temporal_split["train_start"]
+            train_end = temporal_split["train_end"]
+            test_start = temporal_split["test_start"]
+            test_end = temporal_split["test_end"]
+            test_sample_size = temporal_split.get("test_sample_size", sample_size // 5)
+
+            # Générer les partitions de train (par exemple: 2023-01 à 2023-11)
+            train_partitions = []
+            if train_start and train_end:
+                # Parsing simple YYYY-MM
+                start_year, start_month = map(int, train_start.split("-"))
+                end_year, end_month = map(int, train_end.split("-"))
+
+                current_year, current_month = start_year, start_month
+                while (current_year, current_month) <= (end_year, end_month):
+                    train_partitions.append(f"{current_year}-{current_month:02d}")
+                    current_month += 1
+                    if current_month > 12:
+                        current_month = 1
+                        current_year += 1
+
+            # Partitions de test
+            test_partitions = []
+            if test_start and test_end:
+                start_year, start_month = map(int, test_start.split("-"))
+                end_year, end_month = map(int, test_end.split("-"))
+
+                current_year, current_month = start_year, start_month
+                while (current_year, current_month) <= (end_year, end_month):
+                    test_partitions.append(f"{current_year}-{current_month:02d}")
+                    current_month += 1
+                    if current_month > 12:
+                        current_month = 1
+                        current_year += 1
+
+            logger.info(f"Train partitions: {train_partitions}")
+            logger.info(f"Test partitions: {test_partitions}")
+
+            # Charger données d'entraînement
+            train_df = load_dataset(
+                dataset_name, limit=sample_size, partitions=train_partitions
+            )
+            logger.info(f"Loaded {len(train_df):,} train rows from {dataset_name}")
+
+            # Charger données de test
+            test_df = load_dataset(
+                dataset_name, limit=test_sample_size, partitions=test_partitions
+            )
+            logger.info(f"Loaded {len(test_df):,} test rows from {dataset_name}")
+
+            return train_df, test_df
+
+        else:
+            # Chargement classique avec support partitions
+            dataset = dataiku.Dataset(dataset_name)
+            if partitions:
+                # Charger partitions spécifiques
+                df_list = []
+                for partition in partitions:
+                    try:
+                        df_part = dataset.get_dataframe(
+                            partition=partition,
+                            limit=sample_size // len(partitions)
+                            if len(partitions) > 1
+                            else sample_size,
+                        )
+                        df_list.append(df_part)
+                    except Exception as e:
+                        logger.warning(f"Partition {partition} not found: {e}")
+
+                if df_list:
+                    df = pd.concat(df_list, ignore_index=True)
+                    if len(df) > sample_size:
+                        df = df.sample(n=sample_size, random_state=42)
+                else:
+                    # Fallback sans partitions
+                    df = dataset.get_dataframe(limit=sample_size)
+            else:
+                df = dataset.get_dataframe(limit=sample_size)
+
+            logger.info(f"Loaded {len(df):,} rows from {dataset_name}")
+            return df, None
+
+    except Exception as e:
+        logger.error(f"Error loading dataset {dataset_name}: {e}")
+        # Fallback simple
+        dataset = dataiku.Dataset(dataset_name)
+        df = dataset.get_dataframe(limit=sample_size)
+        return df, None
 
 
 class T4RecAdvancedModel(torch.nn.Module):
@@ -520,10 +628,20 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
     # Load data
     dataset_name = config["data"]["dataset_name"]
     sample_size = config["data"]["sample_size"]
-    df = _load_dataframe(dataset_name, sample_size)
+    partitions = config["data"].get("partitions")
+    temporal_split = config["data"].get("temporal_split")
+
+    train_df, test_df = _load_dataframe(
+        dataset_name, sample_size, partitions, temporal_split
+    )
 
     if config["runtime"]["verbose"]:
-        logger.info(f"Loaded {len(df)} samples from {dataset_name}")
+        logger.info(f"Loaded {len(train_df)} train samples from {dataset_name}")
+        if test_df is not None:
+            logger.info(f"Loaded {len(test_df)} test samples for temporal validation")
+
+    # Use train_df as primary df for processing
+    df = train_df
 
     # Get features
     seq_cols = config["features"]["sequence_cols"]
@@ -788,6 +906,106 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
 
     execution_time = time.time() - start_time
 
+    # Save outputs to Dataiku datasets
+    saved_datasets = {}
+    outputs_config = config["outputs"]
+
+    if _HAS_DATAIKU and any(
+        outputs_config.get(f"{name}_dataset")
+        for name in ["features", "predictions", "metrics", "model_artifacts"]
+    ):
+        logger.info("Saving outputs to Dataiku datasets...")
+
+        try:
+            # Save features dataset
+            if outputs_config.get("features_dataset"):
+                features_df = pd.DataFrame(
+                    {
+                        "feature_name": seq_cols_filtered + cat_cols_filtered,
+                        "feature_type": ["sequence"] * len(seq_cols_filtered)
+                        + ["categorical"] * len(cat_cols_filtered),
+                        "importance": [1.0]
+                        * (
+                            len(seq_cols_filtered) + len(cat_cols_filtered)
+                        ),  # Placeholder
+                    }
+                )
+
+                features_dataset = dataiku.Dataset(outputs_config["features_dataset"])
+                features_dataset.write_with_schema(features_df)
+                saved_datasets["features"] = outputs_config["features_dataset"]
+                logger.info(f"Features saved to {outputs_config['features_dataset']}")
+
+            # Save predictions dataset
+            if outputs_config.get("predictions_dataset"):
+                predictions_df = pd.DataFrame(
+                    {
+                        "prediction_id": range(len(prediction_scores)),
+                        "raw_outputs": [pred.tolist() for pred in prediction_scores],
+                        "predicted_class": np.argmax(prediction_scores, axis=1),
+                        "true_class": true_labels,
+                        "confidence": np.max(prediction_scores, axis=1),
+                    }
+                )
+
+                predictions_dataset = dataiku.Dataset(
+                    outputs_config["predictions_dataset"]
+                )
+                predictions_dataset.write_with_schema(predictions_df)
+                saved_datasets["predictions"] = outputs_config["predictions_dataset"]
+                logger.info(
+                    f"Predictions saved to {outputs_config['predictions_dataset']}"
+                )
+
+            # Save metrics dataset
+            if outputs_config.get("metrics_dataset"):
+                metrics_df = pd.DataFrame(
+                    {
+                        "metric_name": ["accuracy", "precision", "recall", "f1"],
+                        "metric_value": [final_accuracy, precision, recall, f1],
+                        "dataset": ["validation"] * 4,
+                        "timestamp": [pd.Timestamp.now()] * 4,
+                    }
+                )
+
+                metrics_dataset = dataiku.Dataset(outputs_config["metrics_dataset"])
+                metrics_dataset.write_with_schema(metrics_df)
+                saved_datasets["metrics"] = outputs_config["metrics_dataset"]
+                logger.info(f"Metrics saved to {outputs_config['metrics_dataset']}")
+
+            # Save model artifacts
+            if outputs_config.get("model_artifacts_dataset"):
+                model_info_df = pd.DataFrame(
+                    {
+                        "artifact_name": [
+                            "model_config",
+                            "model_architecture",
+                            "training_config",
+                        ],
+                        "artifact_value": [
+                            str(config["model"]),
+                            f"T4Rec-XLNet-{config['model']['n_layers']}L-{config['model']['n_heads']}H-{config['model']['d_model']}D",
+                            str(config["training"]),
+                        ],
+                        "timestamp": [pd.Timestamp.now()] * 3,
+                    }
+                )
+
+                artifacts_dataset = dataiku.Dataset(
+                    outputs_config["model_artifacts_dataset"]
+                )
+                artifacts_dataset.write_with_schema(model_info_df)
+                saved_datasets["model_artifacts"] = outputs_config[
+                    "model_artifacts_dataset"
+                ]
+                logger.info(
+                    f"Model artifacts saved to {outputs_config['model_artifacts_dataset']}"
+                )
+
+        except Exception as e:
+            logger.warning(f"Error saving to Dataiku datasets: {e}")
+            logger.info("Datasets might need to be created manually in Dataiku first")
+
     return {
         "metrics": {
             "accuracy": final_accuracy,
@@ -812,6 +1030,7 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
             "target_classes": target_vocab_size,
         },
         "execution_time": execution_time,
+        "saved_datasets": saved_datasets,
     }
 
 
