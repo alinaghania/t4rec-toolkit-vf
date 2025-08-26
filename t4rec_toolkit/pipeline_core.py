@@ -263,52 +263,40 @@ def _load_dataframe(
             logger.info(f"Train partitions: {train_partitions}")
             logger.info(f"Test partitions: {test_partitions}")
 
-            # Charger données d'entraînement
+            # Charger données d'entraînement avec syntaxe Dataiku moderne
             train_dataset = dataiku.Dataset(dataset_name)
-            train_df_list = []
-            for partition in train_partitions:
-                try:
-                    df_part = train_dataset.get_dataframe(
-                        partition=partition,
-                        limit=sample_size // len(train_partitions)
-                        if len(train_partitions) > 1
-                        else sample_size,
-                    )
-                    train_df_list.append(df_part)
-                except Exception as e:
-                    logger.warning(f"Train partition {partition} not found: {e}")
-
-            if train_df_list:
-                train_df = pd.concat(train_df_list, ignore_index=True)
-                if len(train_df) > sample_size:
-                    train_df = train_df.sample(n=sample_size, random_state=42)
-            else:
-                # Fallback sans partitions
+            try:
+                # Ajouter les partitions à lire (syntaxe moderne Dataiku)
+                partition_range = "/".join(train_partitions)  # ex: "2023-01/2023-11"
+                train_dataset.add_read_partitions(partition_range)
+                train_df = train_dataset.get_dataframe(limit=sample_size)
+                logger.info(
+                    f"Loaded {len(train_df):,} train rows using partition range: {partition_range}"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Partition range failed: {e}, falling back to full dataset"
+                )
+                # Fallback: charger tout le dataset puis filtrer
                 train_df = train_dataset.get_dataframe(limit=sample_size)
 
             logger.info(f"Loaded {len(train_df):,} train rows from {dataset_name}")
 
-            # Charger données de test
+            # Charger données de test avec syntaxe Dataiku moderne
             test_dataset = dataiku.Dataset(dataset_name)
-            test_df_list = []
-            for partition in test_partitions:
-                try:
-                    df_part = test_dataset.get_dataframe(
-                        partition=partition,
-                        limit=test_sample_size // len(test_partitions)
-                        if len(test_partitions) > 1
-                        else test_sample_size,
-                    )
-                    test_df_list.append(df_part)
-                except Exception as e:
-                    logger.warning(f"Test partition {partition} not found: {e}")
-
-            if test_df_list:
-                test_df = pd.concat(test_df_list, ignore_index=True)
-                if len(test_df) > test_sample_size:
-                    test_df = test_df.sample(n=test_sample_size, random_state=42)
-            else:
-                # Fallback sans partitions
+            try:
+                # Ajouter les partitions de test à lire
+                test_partition_range = "/".join(test_partitions)  # ex: "2023-12"
+                test_dataset.add_read_partitions(test_partition_range)
+                test_df = test_dataset.get_dataframe(limit=test_sample_size)
+                logger.info(
+                    f"Loaded {len(test_df):,} test rows using partition range: {test_partition_range}"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Test partition range failed: {e}, falling back to full dataset"
+                )
+                # Fallback: charger tout le dataset puis filtrer
                 test_df = test_dataset.get_dataframe(limit=test_sample_size)
 
             logger.info(f"Loaded {len(test_df):,} test rows from {dataset_name}")
@@ -316,29 +304,17 @@ def _load_dataframe(
             return train_df, test_df
 
         else:
-            # Chargement classique avec support partitions
+            # Chargement classique avec support partitions moderne
             dataset = dataiku.Dataset(dataset_name)
             if partitions:
-                # Charger partitions spécifiques
-                df_list = []
-                for partition in partitions:
-                    try:
-                        df_part = dataset.get_dataframe(
-                            partition=partition,
-                            limit=sample_size // len(partitions)
-                            if len(partitions) > 1
-                            else sample_size,
-                        )
-                        df_list.append(df_part)
-                    except Exception as e:
-                        logger.warning(f"Partition {partition} not found: {e}")
-
-                if df_list:
-                    df = pd.concat(df_list, ignore_index=True)
-                    if len(df) > sample_size:
-                        df = df.sample(n=sample_size, random_state=42)
-                else:
-                    # Fallback sans partitions
+                try:
+                    # Syntaxe moderne pour partitions multiples
+                    partition_range = "/".join(partitions)  # ex: "2023-01/2023-11"
+                    dataset.add_read_partitions(partition_range)
+                    df = dataset.get_dataframe(limit=sample_size)
+                    logger.info(f"Loaded with partition range: {partition_range}")
+                except Exception as e:
+                    logger.warning(f"Partition range failed: {e}, loading full dataset")
                     df = dataset.get_dataframe(limit=sample_size)
             else:
                 df = dataset.get_dataframe(limit=sample_size)
@@ -1300,4 +1276,5 @@ def get_config_schema() -> Dict[str, Any]:
             },
         },
     }
+
 
