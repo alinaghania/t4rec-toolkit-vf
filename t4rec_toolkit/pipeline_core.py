@@ -217,7 +217,8 @@ def _load_dataframe(
         raise RuntimeError("Dataiku not available - temporal split requires Dataiku")
 
     try:
-        from .adapters.dataiku_adapter import load_dataset
+        # Import direct de dataiku au lieu de load_dataset qui n'existe pas
+        import dataiku
 
         # Si temporal_split est défini, charger train et test séparément
         if temporal_split:
@@ -263,15 +264,53 @@ def _load_dataframe(
             logger.info(f"Test partitions: {test_partitions}")
 
             # Charger données d'entraînement
-            train_df = load_dataset(
-                dataset_name, limit=sample_size, partitions=train_partitions
-            )
+            train_dataset = dataiku.Dataset(dataset_name)
+            train_df_list = []
+            for partition in train_partitions:
+                try:
+                    df_part = train_dataset.get_dataframe(
+                        partition=partition,
+                        limit=sample_size // len(train_partitions)
+                        if len(train_partitions) > 1
+                        else sample_size,
+                    )
+                    train_df_list.append(df_part)
+                except Exception as e:
+                    logger.warning(f"Train partition {partition} not found: {e}")
+
+            if train_df_list:
+                train_df = pd.concat(train_df_list, ignore_index=True)
+                if len(train_df) > sample_size:
+                    train_df = train_df.sample(n=sample_size, random_state=42)
+            else:
+                # Fallback sans partitions
+                train_df = train_dataset.get_dataframe(limit=sample_size)
+
             logger.info(f"Loaded {len(train_df):,} train rows from {dataset_name}")
 
             # Charger données de test
-            test_df = load_dataset(
-                dataset_name, limit=test_sample_size, partitions=test_partitions
-            )
+            test_dataset = dataiku.Dataset(dataset_name)
+            test_df_list = []
+            for partition in test_partitions:
+                try:
+                    df_part = test_dataset.get_dataframe(
+                        partition=partition,
+                        limit=test_sample_size // len(test_partitions)
+                        if len(test_partitions) > 1
+                        else test_sample_size,
+                    )
+                    test_df_list.append(df_part)
+                except Exception as e:
+                    logger.warning(f"Test partition {partition} not found: {e}")
+
+            if test_df_list:
+                test_df = pd.concat(test_df_list, ignore_index=True)
+                if len(test_df) > test_sample_size:
+                    test_df = test_df.sample(n=test_sample_size, random_state=42)
+            else:
+                # Fallback sans partitions
+                test_df = test_dataset.get_dataframe(limit=test_sample_size)
+
             logger.info(f"Loaded {len(test_df):,} test rows from {dataset_name}")
 
             return train_df, test_df
@@ -1025,8 +1064,11 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
         },
         "data_info": {
             "rows": len(df),
+            "train_samples": len(train_targets),
+            "val_samples": len(val_targets),
             "n_sequence_features": len(seq_cols),
             "n_categorical_features": len(cat_cols),
+            "n_features": len(seq_cols_filtered) + len(cat_cols_filtered),
             "target_classes": target_vocab_size,
         },
         "execution_time": execution_time,
