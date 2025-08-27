@@ -951,42 +951,222 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
                 saved_datasets["features"] = outputs_config["features_dataset"]
                 logger.info(f"Features saved to {outputs_config['features_dataset']}")
 
-            # Save predictions dataset
+            # Save predictions dataset with business details
             if outputs_config.get("predictions_dataset"):
-                predictions_df = pd.DataFrame(
-                    {
-                        "prediction_id": range(len(prediction_scores)),
-                        "raw_outputs": [pred.tolist() for pred in prediction_scores],
-                        "predicted_class": np.argmax(prediction_scores, axis=1),
-                        "true_class": true_labels,
-                        "confidence": np.max(prediction_scores, axis=1),
-                    }
-                )
+                # Get class to product mapping (assuming target classes are product IDs)
+                unique_targets = np.unique(true_labels)
+                target_vocab = {i: f"PRODUIT_{i}" for i in unique_targets}
 
+                # Create detailed predictions DataFrame
+                predictions_list = []
+                for idx, (pred_scores, true_class) in enumerate(
+                    zip(prediction_scores, true_labels)
+                ):
+                    # Get top 5 predictions
+                    top5_indices = np.argsort(pred_scores)[-5:][::-1]
+                    top5_scores = pred_scores[top5_indices]
+                    top5_products = [
+                        target_vocab.get(i, f"PRODUIT_{i}") for i in top5_indices
+                    ]
+
+                    # Main prediction
+                    predicted_class = np.argmax(pred_scores)
+                    predicted_product = target_vocab.get(
+                        predicted_class, f"PRODUIT_{predicted_class}"
+                    )
+                    true_product = target_vocab.get(true_class, f"PRODUIT_{true_class}")
+
+                    # Prediction result
+                    prediction_correct = predicted_class == true_class
+                    confidence_score = np.max(pred_scores)
+
+                    predictions_list.append(
+                        {
+                            "client_id": idx + 1,
+                            "predicted_product": predicted_product,
+                            "predicted_product_id": int(predicted_class),
+                            "true_product": true_product,
+                            "true_product_id": int(true_class),
+                            "prediction_correct": prediction_correct,
+                            "confidence_score": float(confidence_score),
+                            "top1_product": top5_products[0],
+                            "top1_score": float(top5_scores[0]),
+                            "top2_product": top5_products[1]
+                            if len(top5_products) > 1
+                            else None,
+                            "top2_score": float(top5_scores[1])
+                            if len(top5_scores) > 1
+                            else None,
+                            "top3_product": top5_products[2]
+                            if len(top5_products) > 2
+                            else None,
+                            "top3_score": float(top5_scores[2])
+                            if len(top5_scores) > 2
+                            else None,
+                            "top4_product": top5_products[3]
+                            if len(top5_products) > 3
+                            else None,
+                            "top4_score": float(top5_scores[3])
+                            if len(top5_scores) > 3
+                            else None,
+                            "top5_product": top5_products[4]
+                            if len(top5_products) > 4
+                            else None,
+                            "top5_score": float(top5_scores[4])
+                            if len(top5_scores) > 4
+                            else None,
+                            "raw_scores_json": str(pred_scores.tolist()),
+                            "prediction_timestamp": pd.Timestamp.now(),
+                        }
+                    )
+
+                predictions_df = pd.DataFrame(predictions_list)
                 predictions_dataset = dataiku.Dataset(
                     outputs_config["predictions_dataset"]
                 )
                 predictions_dataset.write_with_schema(predictions_df)
                 saved_datasets["predictions"] = outputs_config["predictions_dataset"]
                 logger.info(
-                    f"Predictions saved to {outputs_config['predictions_dataset']}"
+                    f"Detailed predictions saved to {outputs_config['predictions_dataset']}"
+                )
+                logger.info(
+                    f"Saved {len(predictions_df)} predictions with business details"
                 )
 
-            # Save metrics dataset
+            # Save metrics dataset with Top-K details
             if outputs_config.get("metrics_dataset"):
-                metrics_df = pd.DataFrame(
-                    {
-                        "metric_name": ["accuracy", "precision", "recall", "f1"],
-                        "metric_value": [final_accuracy, precision, recall, f1],
-                        "dataset": ["validation"] * 4,
-                        "timestamp": [pd.Timestamp.now()] * 4,
-                    }
-                )
+                metrics_list = []
 
+                # Standard metrics
+                standard_metrics = [
+                    ("accuracy", final_accuracy, "standard", "validation"),
+                    ("precision", precision, "standard", "validation"),
+                    ("recall", recall, "standard", "validation"),
+                    ("f1", f1, "standard", "validation"),
+                ]
+
+                for (
+                    metric_name,
+                    metric_value,
+                    metric_type,
+                    dataset_split,
+                ) in standard_metrics:
+                    metrics_list.append(
+                        {
+                            "metric_name": metric_name,
+                            "metric_value": float(metric_value),
+                            "metric_type": metric_type,
+                            "dataset_split": dataset_split,
+                            "k_value": None,
+                            "timestamp": pd.Timestamp.now(),
+                        }
+                    )
+
+                # Enhanced metrics with T4Rec ranking metrics if available
+                try:
+                    from transformers4rec.torch.ranking_metric import NDCGAt, RecallAt
+
+                    # Add T4Rec ranking metrics to the model
+                    ranking_metrics = [
+                        NDCGAt(top_ks=[1, 3, 5, 10], labels_onehot=True),
+                        RecallAt(top_ks=[1, 3, 5, 10], labels_onehot=True),
+                    ]
+
+                    # Calculate ranking metrics on validation data
+                    if len(prediction_scores) > 0:
+                        logger.info("Calculating T4Rec ranking metrics...")
+
+                        # Convert to one-hot for T4Rec metrics
+                        target_vocab_size = len(np.unique(true_labels))
+                        true_labels_onehot = np.zeros(
+                            (len(true_labels), target_vocab_size)
+                        )
+                        true_labels_onehot[np.arange(len(true_labels)), true_labels] = 1
+
+                        # Convert to tensors
+                        predictions_tensor = torch.tensor(
+                            prediction_scores, dtype=torch.float32
+                        )
+                        targets_tensor = torch.tensor(
+                            true_labels_onehot, dtype=torch.float32
+                        )
+
+                        # Calculate T4Rec ranking metrics
+                        t4rec_ranking_results = {}
+                        for metric in ranking_metrics:
+                            try:
+                                metric_result = metric(
+                                    predictions_tensor, targets_tensor
+                                )
+                                metric_name = f"{metric.__class__.__name__}"
+                                if hasattr(metric, "top_ks"):
+                                    for k in metric.top_ks:
+                                        t4rec_ranking_results[f"{metric_name}@{k}"] = (
+                                            float(metric_result)
+                                        )
+                                else:
+                                    t4rec_ranking_results[metric_name] = float(
+                                        metric_result
+                                    )
+
+                                logger.info(f"T4Rec {metric_name}: {metric_result:.4f}")
+                            except Exception as e:
+                                logger.warning(
+                                    f"Could not calculate {metric.__class__.__name__}: {e}"
+                                )
+
+                        # Store T4Rec ranking results for later use
+                        logger.info(
+                            f"T4Rec ranking metrics calculated: {len(t4rec_ranking_results)} metrics"
+                        )
+
+                except ImportError:
+                    logger.info("T4Rec ranking metrics not available in this version")
+                except Exception as e:
+                    logger.warning(f"Error calculating T4Rec ranking metrics: {e}")
+
+                # Calculate and save Top-K metrics
+                if len(prediction_scores) > 0:
+                    logger.info("Calculating Top-K metrics for metrics dataset...")
+                    k_values = [1, 3, 5, 10]
+                    topk_metrics = evaluate_topk_metrics(
+                        predictions=prediction_scores,
+                        targets=true_labels,
+                        k_values=k_values,
+                    )
+
+                    # Add Top-K metrics to list
+                    for k in k_values:
+                        if k in topk_metrics:
+                            k_data = topk_metrics[k]
+                            topk_metrics_to_save = [
+                                ("precision_at_k", k_data.get("precision", 0.0)),
+                                ("recall_at_k", k_data.get("recall", 0.0)),
+                                ("f1_at_k", k_data.get("f1", 0.0)),
+                                ("ndcg_at_k", k_data.get("ndcg", 0.0)),
+                                ("hit_rate_at_k", k_data.get("hit_rate", 0.0)),
+                            ]
+
+                            for metric_name, metric_value in topk_metrics_to_save:
+                                metrics_list.append(
+                                    {
+                                        "metric_name": metric_name,
+                                        "metric_value": float(metric_value),
+                                        "metric_type": "topk",
+                                        "dataset_split": "validation",
+                                        "k_value": k,
+                                        "timestamp": pd.Timestamp.now(),
+                                    }
+                                )
+
+                metrics_df = pd.DataFrame(metrics_list)
                 metrics_dataset = dataiku.Dataset(outputs_config["metrics_dataset"])
                 metrics_dataset.write_with_schema(metrics_df)
                 saved_datasets["metrics"] = outputs_config["metrics_dataset"]
-                logger.info(f"Metrics saved to {outputs_config['metrics_dataset']}")
+                logger.info(
+                    f"Detailed metrics (standard + Top-K) saved to {outputs_config['metrics_dataset']}"
+                )
+                logger.info(f"Saved {len(metrics_df)} metric records")
 
             # Save model artifacts
             if outputs_config.get("model_artifacts_dataset"):
@@ -1054,7 +1234,7 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
 
 # Top-K evaluation functions
 def evaluate_topk_metrics(predictions=None, targets=None, k_values=[1, 3, 4]):
-    """Evaluate Top-K metrics using real T4Rec predictions"""
+    """Evaluate Top-K metrics using real T4Rec predictions with NDCG and Hit Rate"""
     if predictions is None or targets is None:
         raise ValueError("Real predictions and targets are required")
 
@@ -1064,40 +1244,82 @@ def evaluate_topk_metrics(predictions=None, targets=None, k_values=[1, 3, 4]):
         precisions = []
         recalls = []
         f1_scores = []
+        ndcgs = []
+        hit_rates = []
 
+        # Loop through each prediction and target pair
         for pred_logits, target in zip(predictions, targets):
+            # Get the top k predictions
             top_k_indices = np.argsort(pred_logits)[-k:][::-1]
             top_k_preds = set(top_k_indices)
 
             target_set = {target}
             intersection = top_k_preds.intersection(target_set)
 
+            # Calculate precision
             precision = len(intersection) / k
+            # Calculate recall
             recall = len(intersection) / len(target_set)
 
+            # Calculate F1 score if precision and recall are not zero
             if precision + recall > 0:
                 f1 = 2 * (precision * recall) / (precision + recall)
             else:
                 f1 = 0.0
 
+            # Calculate NDCG@K
+            ndcg = _calculate_ndcg_at_k(pred_logits, target, k)
+
+            # Calculate Hit Rate@K (binary: 1 if target in top-k, 0 otherwise)
+            hit_rate = 1.0 if target in top_k_preds else 0.0
+
             precisions.append(precision)
             recalls.append(recall)
             f1_scores.append(f1)
+            ndcgs.append(ndcg)
+            hit_rates.append(hit_rate)
 
+        # Store the calculated metrics for each k value
         metrics_by_k[k] = {
             "precision": np.mean(precisions),
             "recall": np.mean(recalls),
             "f1_score": np.mean(f1_scores),
+            "ndcg": np.mean(ndcgs),
+            "hit_rate": np.mean(hit_rates),
         }
 
     return metrics_by_k
 
 
+def _calculate_ndcg_at_k(predictions, target, k):
+    """Calculate NDCG@K for a single prediction"""
+    # Sort predictions in descending order
+    sorted_indices = np.argsort(predictions)[::-1]
+
+    # Calculate DCG@K
+    dcg = 0.0
+    for i, item_idx in enumerate(sorted_indices[:k]):
+        if item_idx == target:
+            # Relevance = 1 for correct item, 0 for others
+            relevance = 1.0
+            # DCG formula: relevance / log2(position + 1)
+            dcg += relevance / np.log2(i + 2)  # i+2 because position starts at 1
+
+    # Calculate IDCG@K (Ideal DCG - best possible ranking)
+    # For binary relevance (0/1), IDCG@K = 1/log2(2) = 1 if target exists, 0 otherwise
+    idcg = 1.0 / np.log2(2) if k >= 1 else 0.0
+
+    # NDCG = DCG / IDCG
+    ndcg = dcg / idcg if idcg > 0 else 0.0
+
+    return ndcg
+
+
 def format_topk_table(metrics_by_k, baseline_metrics=None):
-    """Format Top-K metrics table"""
+    """Format Top-K metrics table with NDCG and Hit Rate"""
     lines = []
     lines.append("T4REC XLNET TOP-K INFERENCE METRICS")
-    lines.append("=" * 60)
+    lines.append("=" * 80)
 
     header = "| Metric          |"
     for k in sorted(metrics_by_k.keys()):
@@ -1109,6 +1331,8 @@ def format_topk_table(metrics_by_k, baseline_metrics=None):
         ("precision", "Precision"),
         ("recall", "Recall"),
         ("f1_score", "F1-Score"),
+        ("ndcg", "NDCG"),
+        ("hit_rate", "Hit Rate"),
     ]:
         row = f"| {display_name:<15} |"
         for k in sorted(metrics_by_k.keys()):
@@ -1124,6 +1348,10 @@ def format_topk_table(metrics_by_k, baseline_metrics=None):
         metrics_by_k.keys(), key=lambda k: metrics_by_k[k]["precision"]
     )
     best_k_recall = max(metrics_by_k.keys(), key=lambda k: metrics_by_k[k]["recall"])
+    best_k_ndcg = max(metrics_by_k.keys(), key=lambda k: metrics_by_k[k]["ndcg"])
+    best_k_hit_rate = max(
+        metrics_by_k.keys(), key=lambda k: metrics_by_k[k]["hit_rate"]
+    )
 
     lines.append(
         f"   Best Precision: K={best_k_precision} ({metrics_by_k[best_k_precision]['precision'] * 100:.1f}%)"
@@ -1131,6 +1359,19 @@ def format_topk_table(metrics_by_k, baseline_metrics=None):
     lines.append(
         f"   Best Recall: K={best_k_recall} ({metrics_by_k[best_k_recall]['recall'] * 100:.1f}%)"
     )
+    lines.append(
+        f"   Best NDCG: K={best_k_ndcg} ({metrics_by_k[best_k_ndcg]['ndcg'] * 100:.1f}%)"
+    )
+    lines.append(
+        f"   Best Hit Rate: K={best_k_hit_rate} ({metrics_by_k[best_k_hit_rate]['hit_rate'] * 100:.1f}%)"
+    )
+    lines.append("")
+    lines.append("METRIC EXPLANATIONS:")
+    lines.append("   • NDCG: Quality of ranking (1.0 = perfect order)")
+    lines.append("   • Hit Rate: % clients finding their product in Top-K")
+    lines.append("   • Precision: % relevant items in Top-K recommendations")
+    lines.append("   • Recall: % relevant items found out of all relevant")
+    lines.append("")
     lines.append("   Powered by T4Rec XLNet architecture")
 
     return "\n".join(lines)
@@ -1276,5 +1517,6 @@ def get_config_schema() -> Dict[str, Any]:
             },
         },
     }
+
 
 
