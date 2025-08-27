@@ -1062,69 +1062,7 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
                         }
                     )
 
-                # Enhanced metrics with T4Rec ranking metrics if available
-                try:
-                    from transformers4rec.torch.ranking_metric import NDCGAt, RecallAt
-
-                    # Add T4Rec ranking metrics to the model
-                    ranking_metrics = [
-                        NDCGAt(top_ks=[1, 3, 5, 10], labels_onehot=True),
-                        RecallAt(top_ks=[1, 3, 5, 10], labels_onehot=True),
-                    ]
-
-                    # Calculate ranking metrics on validation data
-                    if len(prediction_scores) > 0:
-                        logger.info("Calculating T4Rec ranking metrics...")
-
-                        # Convert to one-hot for T4Rec metrics
-                        target_vocab_size = len(np.unique(true_labels))
-                        true_labels_onehot = np.zeros(
-                            (len(true_labels), target_vocab_size)
-                        )
-                        true_labels_onehot[np.arange(len(true_labels)), true_labels] = 1
-
-                        # Convert to tensors
-                        predictions_tensor = torch.tensor(
-                            prediction_scores, dtype=torch.float32
-                        )
-                        targets_tensor = torch.tensor(
-                            true_labels_onehot, dtype=torch.float32
-                        )
-
-                        # Calculate T4Rec ranking metrics
-                        t4rec_ranking_results = {}
-                        for metric in ranking_metrics:
-                            try:
-                                metric_result = metric(
-                                    predictions_tensor, targets_tensor
-                                )
-                                metric_name = f"{metric.__class__.__name__}"
-                                if hasattr(metric, "top_ks"):
-                                    for k in metric.top_ks:
-                                        t4rec_ranking_results[f"{metric_name}@{k}"] = (
-                                            float(metric_result)
-                                        )
-                                else:
-                                    t4rec_ranking_results[metric_name] = float(
-                                        metric_result
-                                    )
-
-                                logger.info(f"T4Rec {metric_name}: {metric_result:.4f}")
-                            except Exception as e:
-                                logger.warning(
-                                    f"Could not calculate {metric.__class__.__name__}: {e}"
-                                )
-
-                        # Store T4Rec ranking results for later return
-                        t4rec_ranking_metrics = t4rec_ranking_results
-                        logger.info(
-                            f"T4Rec ranking metrics calculated: {len(t4rec_ranking_results)} metrics"
-                        )
-
-                except ImportError:
-                    logger.info("T4Rec ranking metrics not available in this version")
-                except Exception as e:
-                    logger.warning(f"Error calculating T4Rec ranking metrics: {e}")
+                # Note: T4Rec ranking metrics removed as they are not compatible with our T4Rec 23.04.00 setup
 
                 # Calculate and save Top-K metrics
                 if len(prediction_scores) > 0:
@@ -1233,9 +1171,7 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
         "saved_datasets": saved_datasets,
     }
 
-    # Add T4Rec ranking metrics if available
-    if "t4rec_ranking_metrics" in locals():
-        return_dict["t4rec_ranking_metrics"] = t4rec_ranking_metrics
+    # Note: T4Rec ranking metrics section removed
 
     return return_dict
 
@@ -1291,7 +1227,7 @@ def evaluate_topk_metrics(predictions=None, targets=None, k_values=[1, 3, 4]):
         metrics_by_k[k] = {
             "precision": np.mean(precisions),
             "recall": np.mean(recalls),
-            "f1_score": np.mean(f1_scores),
+            "f1": np.mean(f1_scores),  # Changé f1_score -> f1 pour compatibilité
             "ndcg": np.mean(ndcgs),
             "hit_rate": np.mean(hit_rates),
         }
@@ -1338,7 +1274,7 @@ def format_topk_table(metrics_by_k, baseline_metrics=None):
     for metric_name, display_name in [
         ("precision", "Precision"),
         ("recall", "Recall"),
-        ("f1_score", "F1-Score"),
+        ("f1", "F1-Score"),
         ("ndcg", "NDCG"),
         ("hit_rate", "Hit Rate"),
     ]:
@@ -1525,7 +1461,6 @@ def get_config_schema() -> Dict[str, Any]:
             },
         },
     }
-
 
 
 
