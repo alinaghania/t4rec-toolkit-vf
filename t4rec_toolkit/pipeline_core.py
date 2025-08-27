@@ -1115,7 +1115,8 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
                                     f"Could not calculate {metric.__class__.__name__}: {e}"
                                 )
 
-                        # Store T4Rec ranking results for later use
+                        # Store T4Rec ranking results for later return
+                        t4rec_ranking_metrics = t4rec_ranking_results
                         logger.info(
                             f"T4Rec ranking metrics calculated: {len(t4rec_ranking_results)} metrics"
                         )
@@ -1201,7 +1202,8 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
             logger.warning(f"Error saving to Dataiku datasets: {e}")
             logger.info("Datasets might need to be created manually in Dataiku first")
 
-    return {
+    # Prepare return dictionary
+    return_dict = {
         "metrics": {
             "accuracy": final_accuracy,
             "precision": precision,
@@ -1230,6 +1232,12 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
         "execution_time": execution_time,
         "saved_datasets": saved_datasets,
     }
+
+    # Add T4Rec ranking metrics if available
+    if "t4rec_ranking_metrics" in locals():
+        return_dict["t4rec_ranking_metrics"] = t4rec_ranking_metrics
+
+    return return_dict
 
 
 # Top-K evaluation functions
@@ -1517,6 +1525,7 @@ def get_config_schema() -> Dict[str, Any]:
             },
         },
     }
+
 
 
 
