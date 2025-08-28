@@ -122,6 +122,7 @@ def blank_config() -> Dict[str, Any]:
             "target_col": "",
             "max_seq_features": None,
             "max_cat_features": None,
+            "exclude_target_values": [],
         },
         "model": {
             "d_model": 256,
@@ -662,6 +663,22 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
     seq_cols = config["features"]["sequence_cols"]
     cat_cols = config["features"]["categorical_cols"]
     target_col = config["features"]["target_col"]
+
+    # Target processing: Exclude values if specified in config
+    # Target processing: Exclude values if specified in config
+    exclude_vals = config["features"].get("exclude_target_values", [])
+    if len(exclude_vals) > 0:
+        exclude_lower = {str(val).lower() for val in exclude_vals}
+        mask_excl = df[target_col].astype(str).str.lower().isin(exclude_lower)
+        before_n = len(df)
+        df = df.loc[~mask_excl].reset_index(drop=True)
+        removed_n = before_n - len(df)
+        if config["runtime"]["verbose"]:
+            logger.info(f"Excluded {removed_n} rows by target filter: {exclude_vals}")
+        if len(df) == 0:
+            raise ValueError(
+                f"No samples left after excluding target values: {exclude_vals}"
+            )
 
     # Verify columns exist in dataframe
     available_cols = set(df.columns)
@@ -1399,6 +1416,11 @@ def get_config_schema() -> Dict[str, Any]:
                 "required": True,
                 "desc": "Target column name",
             },
+            "exclude_target_values": {
+                "type": "List[str]",
+                "required": False,
+                "desc": "List of target values to exclude from the dataset, case insensitive",
+            },
         },
         "model": {
             "d_model": {
@@ -1461,6 +1483,7 @@ def get_config_schema() -> Dict[str, Any]:
             },
         },
     }
+
 
 
 
