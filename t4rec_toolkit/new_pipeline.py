@@ -799,3 +799,197 @@ def evaluate_topk_metrics_nbo(predictions, targets, inverse_target_mapping, k_va
     for k in k_values:
         all_metrics[k] = compute_ranking_metrics_at_k(client_ids, labels, scores, products, k)
     return all_metrics, None
+
+# =====================================================================
+# Validation de la configuration
+# =====================================================================
+
+def get_config_schema() -> Dict[str, Any]:
+    """
+    Schéma minimal pour valider la config. 
+    On contrôle surtout la présence/typage des clés utilisées par le pipeline.
+    """
+    return {
+        "data": {
+            "events_dataset": {"type": str, "required": True},
+            "client_id_col": {"type": str, "required": True},
+            "event_time_col": {"type": str, "required": True},
+            "product_col": {"type": str, "required": True},
+            # optionnels
+            "dataset_name": {"type": (str, type(None)), "required": False},
+            "event_extra_cols": {"type": list, "required": False},
+            "profile_categorical_cols": {"type": list, "required": False},
+            "profile_sequence_cols": {"type": list, "required": False},
+        },
+        "sequence": {
+            "months_lookback": {"type": int, "required": True},
+            "time_granularity": {"type": str, "required": True},
+            "min_events_per_client": {"type": int, "required": True},
+            "target_horizon": {"type": int, "required": True},
+            "pad_value": {"type": int, "required": True},
+            "build_target_from_events": {"type": bool, "required": True},
+        },
+        "features": {
+            "exclude_target_values": {"type": list, "required": False},
+            "merge_rare_threshold": {"type": int, "required": True},
+            "other_class_name": {"type": str, "required": True},
+        },
+        "model": {
+            "d_model": {"type": int, "required": True},
+            "n_heads": {"type": int, "required": True},
+            "n_layers": {"type": int, "required": True},
+            "dropout": {"type": float, "required": True},
+            "max_sequence_length": {"type": int, "required": True},
+            "vocab_size": {"type": int, "required": True},
+        },
+        "training": {
+            "batch_size": {"type": int, "required": True},
+            "num_epochs": {"type": int, "required": True},
+            "learning_rate": {"type": float, "required": True},
+            "weight_decay": {"type": float, "required": True},
+            "val_split": {"type": float, "required": True},
+            "class_weighting": {"type": bool, "required": True},
+        },
+        "outputs": {
+            "features_dataset": {"type": (str, type(None)), "required": False},
+            "predictions_dataset": {"type": (str, type(None)), "required": False},
+            "metrics_dataset": {"type": (str, type(None)), "required": False},
+            "model_artifacts_dataset": {"type": (str, type(None)), "required": False},
+            "local_dir": {"type": str, "required": True},
+        },
+        "runtime": {
+            "verbose": {"type": bool, "required": True},
+            "progress": {"type": bool, "required": True},
+            "seed": {"type": (int, type(None)), "required": True},
+        },
+    }
+
+
+def validate_config(config: Dict[str, Any], strict: bool = False) -> List[str]:
+    """
+    Valide la config avant entraînement.
+    - Vérifie la présence et le type de clés essentielles
+    - Vérifie contraintes simples (ex: d_model % n_heads == 0)
+    
+    Retour:
+        Liste d'erreurs (vide si tout est OK)
+    """
+    errors: List[str] = []
+    schema = get_config_schema()
+
+    # Helper pour naviguer dans le dict selon le schéma
+    def _check_block(block_name: str, block_schema: Dict[str, Any]):
+        if block_name not in config:
+            errors.append(f"Bloc '{block_name}' manquant dans la config")
+            return
+        block = config[block_name]
+        for key, spec in block_schema.items():
+            required = spec.get("required", False)
+            expected_type = spec.get("type", object)
+            if required and key not in block:
+                errors.append(f"{block_name}.{key} est requis")
+                continue
+            if key in block and expected_type is not None:
+                if not isinstance(block[key], expected_type):
+                    errors.append(
+                        f"{block_name}.{key} doit être de type {expected_type} (actuel: {type(block[key])})"
+                    )
+
+    for section, sect_schema in schema.items():
+        _check_block(section, sect_schema)
+
+    # Contraintes spécifiques modèle
+    if "model" in config:
+        m = config["model"]
+        if isinstance(m.get("d_model"), int) and isinstance(m.get("n_heads"), int):
+            if m["d_model"] % m["n_heads"] != 0:
+                errors.append("model.d_model doit être divisible par model.n_heads")
+
+        # Séquence maximale ≥ fenêtre temporelle demandée
+        if "max_sequence_length" in m and "sequence" in config:
+            if m["max_sequence_length"] < config["sequence"]["months_lookback"]:
+                errors.append(
+                    "model.max_sequence_length doit être >= sequence.months_lookback"
+                )
+
+    # Blocs data : colonnes doivent être présentes si dataset est fourni
+    if "data" in config:
+        d = config["data"]
+        for col_key in ["client_id_col", "event_time_col", "product_col"]:
+            if not d.get(col_key):
+                errors.append(f"data.{col_key} est requis (non vide)")
+
+    return errors
+
+# =====================================================================
+# Affichage des métriques Top-K (pour le notebook)
+# =====================================================================
+
+def format_topk_table(metrics_by_k: Dict[int, Dict[str, float]], baseline_metrics: Optional[Dict[int, Dict[str, float]]] = None) -> str:
+    """
+    Formate joliment les métriques Top-K.
+
+    metrics_by_k: {K: {"precision":..., "recall":..., "f1":..., "ndcg":..., "hit_rate":..., "coverage":..., ...}}
+    baseline_metrics: métriques de référence (optionnel) pour comparaison.
+    """
+    lines = []
+    lines.append("T4REC XLNET - MÉTRIQUES TOP-K")
+    lines.append("=" * 80)
+
+    # Entête
+    header = "| Metric          |"
+    for k in sorted(metrics_by_k.keys()):
+        header += f" K={k:<8} |"
+    lines.append(header)
+    lines.append("|" + "-" * (len(header) - 2) + "|")
+
+    # Liste des clés à afficher (on mappe depuis nos noms NBO)
+    mapping = [
+        ("Precision@K", "Precision"),
+        ("Recall@K",    "Recall"),
+        ("F1@K",        "F1-Score"),
+        ("NDCG@K",      "NDCG"),
+        ("HitRate@K",   "Hit Rate"),
+        ("Coverage@K",  "Coverage"),
+    ]
+
+    for key, label in mapping:
+        row = f"| {label:<15} |"
+        for k in sorted(metrics_by_k.keys()):
+            val = metrics_by_k[k].get(key, 0.0) * 100.0
+            row += f" {val:>7.2f}% |"
+        lines.append(row)
+
+    lines.append("|" + "-" * (len(header) - 2) + "|")
+    lines.append("")
+    lines.append("📊 INTERPRÉTATION BUSINESS :")
+
+    # Petite synthèse "meilleur K" par métrique
+    def _best_k_for(metric_key: str) -> Tuple[int, float]:
+        best_k = max(metrics_by_k.keys(), key=lambda kk: metrics_by_k[kk].get(metric_key, 0.0))
+        return best_k, metrics_by_k[best_k].get(metric_key, 0.0)
+
+    for key, label in mapping:
+        bk, bv = _best_k_for(key)
+        lines.append(f"   → {label} max à K={bk}: {bv*100:.2f}%")
+
+    lines.append("")
+    lines.append("ℹ️  Définitions :")
+    lines.append("   • Precision@K : % d’items recommandés qui sont pertinents")
+    lines.append("   • Recall@K    : % d’items pertinents retrouvés dans le Top-K")
+    lines.append("   • F1@K        : moyenne harmonique précision / rappel")
+    lines.append("   • NDCG@K      : qualité de l’ordre du ranking")
+    lines.append("   • Hit Rate@K  : % de clients avec ≥1 bon produit dans le Top-K")
+    lines.append("   • Coverage@K  : % des produits couverts par les reco")
+    lines.append("")
+    lines.append("   ✅ Powered by T4Rec XLNet")
+
+    return "\n".join(lines)
+
+
+def print_topk_results(metrics_by_k: Dict[int, Dict[str, float]], baseline_metrics: Optional[Dict[int, Dict[str, float]]] = None) -> None:
+    """
+    Affiche le tableau Top-K en console (utilisé par le notebook).
+    """
+    print(format_topk_table(metrics_by_k, baseline_metrics))
+
