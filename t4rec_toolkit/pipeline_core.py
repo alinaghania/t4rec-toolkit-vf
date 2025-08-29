@@ -1,3 +1,6 @@
+
+
+
 """
 Pure T4Rec XLNet Pipeline - No PyTorch fallback, only T4Rec
 Production pipeline using transformers4rec with XLNet architecture
@@ -660,18 +663,50 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
     df = train_df
 
     # Get features
+    # seq_cols = config["features"]["sequence_cols"]
+    # cat_cols = config["features"]["categorical_cols"]
+    # target_col = config["features"]["target_col"]
+
+   
+    # # Target processing: Exclude values if specified in config
+    # exclude_vals = config["features"].get("exclude_target_values", [])
+    # if len(exclude_vals) > 0:
+    #     exclude_lower = {str(val).lower() for val in exclude_vals}
+    #     mask_excl = df[target_col].astype(str).str.lower().isin(exclude_lower)
+    #     before_n = len(df)
+    #     df = df.loc[~mask_excl].reset_index(drop=True)
+        # Get features
     seq_cols = config["features"]["sequence_cols"]
     cat_cols = config["features"]["categorical_cols"]
     target_col = config["features"]["target_col"]
-
-    # Target processing: Exclude values if specified in config
+    
     # Target processing: Exclude values if specified in config
     exclude_vals = config["features"].get("exclude_target_values", [])
     if len(exclude_vals) > 0:
         exclude_lower = {str(val).lower() for val in exclude_vals}
-        mask_excl = df[target_col].astype(str).str.lower().isin(exclude_lower)
+        target_lower = df[target_col].astype(str).str.lower()
         before_n = len(df)
+        # Log counts BEFORE filtering for each excluded value
+        try:
+            counts_before = {val: int((target_lower == val).sum()) for val in exclude_lower}
+            logger.info(f"Target exclusion (before): {counts_before} out of {before_n} rows")
+        except Exception:
+            pass
+        mask_excl = target_lower.isin(exclude_lower)
         df = df.loc[~mask_excl].reset_index(drop=True)
+        removed_n = before_n - len(df)
+        # Log counts AFTER filtering
+        remaining_after = int(df[target_col].astype(str).str.lower().isin(exclude_lower).sum())
+        logger.info(
+            f"Excluded {removed_n} rows by target filter {exclude_vals}; remaining excluded-class rows after filter = {remaining_after}"
+        )
+        if len(df) == 0:
+            raise ValueError(f"No samples left after excluding target values: {exclude_vals}")
+        
+        
+        
+        
+        
         removed_n = before_n - len(df)
         if config["runtime"]["verbose"]:
             logger.info(f"Excluded {removed_n} rows by target filter: {exclude_vals}")
@@ -730,9 +765,25 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
     # Prepare target
     from sklearn.preprocessing import LabelEncoder
 
+    # encoder = LabelEncoder()
+    # targets = encoder.fit_transform(df[target_col])
+    # target_vocab_size = len(encoder.classes_)
+    
     encoder = LabelEncoder()
     targets = encoder.fit_transform(df[target_col])
     target_vocab_size = len(encoder.classes_)
+    # Post-encoding validation: ensure excluded classes are not in the label space
+    try:
+        if len(exclude_vals) > 0:
+            present_classes_lower = {str(c).lower() for c in encoder.classes_}
+            still_present = present_classes_lower.intersection({str(v).lower() for v in exclude_vals})
+            if still_present:
+                logger.warning(f"Excluded target values still present in classes after encoding: {still_present}")
+            else:
+                logger.info(f"Excluded target values removed from dataset and label space: {exclude_vals}")
+        logger.info(f"Target classes after filtering & encoding: {target_vocab_size}")
+    except Exception:
+        pass
 
     # Keep original vocab_size for embeddings, store target_vocab_size separately
     config["model"]["target_vocab_size"] = target_vocab_size
@@ -796,7 +847,7 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
 
     # Convert to tensors (handle pandas Series properly)
     train_batch = {}
-    val_batch = {}
+    val_batch = {} # contient toutes les features de validation ( pas de batching)
     for col in seq_cols_filtered + cat_cols_filtered:
         # Convert pandas Series to numpy arrays first
         train_values = (
@@ -826,6 +877,8 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
             val_batch[col] = torch.tensor(val_values_int, dtype=torch.long)
         else:  # categorical
             # For categorical features, ensure they're within vocab range
+            
+           
             train_values_int = np.clip(train_values.astype(int), 0, vocab_size - 1)
             val_values_int = np.clip(val_values.astype(int), 0, vocab_size - 1)
             train_batch[col] = torch.tensor(train_values_int, dtype=torch.long)
@@ -841,8 +894,9 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
                     f"Categorical {col}: train_range=[{train_values_int.min()}, {train_values_int.max()}], vocab_size={vocab_size}"
                 )
 
-    train_targets_tensor = torch.tensor(train_targets, dtype=torch.long)
-    val_targets_tensor = torch.tensor(val_targets, dtype=torch.long)
+    #INPUT 2
+    train_targets_tensor = torch.tensor(train_targets, dtype=torch.long) # input2 (labels /targets) : sont les vrai class pour chaque sample
+    val_targets_tensor = torch.tensor(val_targets, dtype=torch.long) # input2 (labels /targets) : sont les vrai class pour chaque sample
 
     # Update config with filtered columns for model creation
     config["features"]["sequence_cols"] = seq_cols_filtered
@@ -865,7 +919,11 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
     # Training loop
     num_epochs = config["training"]["num_epochs"]
     history = []
-    loss_fn = torch.nn.CrossEntropyLoss()
+    
+    #loss function
+    # 1) definition de la regle ( moyenne - log proba vraie classe)
+    loss_fn = torch.nn.CrossEntropyLoss() # reduction pa default = moyenne
+    # mesure l'ecart entre les predic de la class multi classes et les vrai class
 
     if config["runtime"]["progress"] and _HAS_TQDM:
         pbar = tqdm(total=num_epochs, desc="Training T4Rec XLNet")
@@ -874,22 +932,34 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
 
     for epoch in range(num_epochs):
         # Training
-        model.train()
+        model.train() # mode entrainement dropout actid
         optimizer.zero_grad()
 
-        train_outputs = model(train_batch)
-        train_loss = loss_fn(train_outputs, train_targets_tensor)
-        train_loss.backward()
-        optimizer.step()
+        #EVALUONS LA LOSS SUR L'ENSEMBLE D'ENTRAINEMENT
+        
+        #INPUT 1 
+        train_outputs = model(train_batch) # 3: logits sur le batch d'entrainement [batch_size, n_classes]
+        
+        #OUTPUT
+        #output : ( scalair loss) :
+        train_loss = loss_fn(train_outputs, train_targets_tensor) # 4: erreur d'ntrainement loss = moyenne de la cross entropy entre train_outputs et train_targets_tensor
+        train_loss.backward() # 5:calcul des gradients
+        optimizer.step() # 6) mise à jour des poids c
 
         # Validation
-        model.eval()
-        with torch.no_grad():
-            val_outputs = model(val_batch)
-            val_loss = loss_fn(val_outputs, val_targets_tensor)
+        model.eval() # 7 : mode evaluation pas de dropout
+        with torch.no_grad(): # 8 : pas de gradient on n'apprends pas
+            
+            #INPUT 1
+            val_outputs = model(val_batch) # 9: logits sur la validation, input1 (logits) :sont des logits sur toutes les classes
+            
+            #Output ( scalair loss) :
+            val_loss = loss_fn(val_outputs, val_targets_tensor) # 10 : erreur valid ( pour mesurer )
+            # calculée en evaluation sur tout le set de valdation d'un coup 
+            # je ne fais pas de mini batches en val, je passe tout d'un coup
 
             # Calculate accuracy
-            val_predictions = torch.argmax(val_outputs, dim=1)
+            val_predictions = torch.argmax(val_outputs, dim=1) # accuracy
             val_accuracy = (val_predictions == val_targets_tensor).float().mean().item()
 
         history.append(
@@ -1079,7 +1149,7 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
                         }
                     )
 
-                # Note: T4Rec ranking metrics removed as they are not compatible with our T4Rec 23.04.00 setup
+                # Note: T4Rec ranking metrics removed as they are not compatible with our T4Rec 23.04.00 setup :(
 
                 # Calculate and save Top-K metrics
                 if len(prediction_scores) > 0:
@@ -1483,7 +1553,3 @@ def get_config_schema() -> Dict[str, Any]:
             },
         },
     }
-
-
-
-
