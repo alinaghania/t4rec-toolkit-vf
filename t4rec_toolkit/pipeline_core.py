@@ -1,6 +1,3 @@
-
-
-
 """
 Pure T4Rec XLNet Pipeline - No PyTorch fallback, only T4Rec
 Production pipeline using transformers4rec with XLNet architecture
@@ -667,7 +664,6 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
     # cat_cols = config["features"]["categorical_cols"]
     # target_col = config["features"]["target_col"]
 
-   
     # # Target processing: Exclude values if specified in config
     # exclude_vals = config["features"].get("exclude_target_values", [])
     # if len(exclude_vals) > 0:
@@ -675,38 +671,70 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
     #     mask_excl = df[target_col].astype(str).str.lower().isin(exclude_lower)
     #     before_n = len(df)
     #     df = df.loc[~mask_excl].reset_index(drop=True)
-        # Get features
+    # Get features
     seq_cols = config["features"]["sequence_cols"]
     cat_cols = config["features"]["categorical_cols"]
     target_col = config["features"]["target_col"]
-    
+
     # Target processing: Exclude values if specified in config
     exclude_vals = config["features"].get("exclude_target_values", [])
     if len(exclude_vals) > 0:
         exclude_lower = {str(val).lower() for val in exclude_vals}
         target_lower = df[target_col].astype(str).str.lower()
         before_n = len(df)
+
         # Log counts BEFORE filtering for each excluded value
         try:
-            counts_before = {val: int((target_lower == val).sum()) for val in exclude_lower}
-            logger.info(f"Target exclusion (before): {counts_before} out of {before_n} rows")
-        except Exception:
-            pass
+            counts_before = {
+                val: int((target_lower == val).sum()) for val in exclude_lower
+            }
+            logger.info(
+                f"🔍 EXCLUSION ANALYSIS - Target values to exclude: {exclude_vals}"
+            )
+            logger.info(
+                f"📊 BEFORE filtering: {counts_before} out of {before_n} total rows"
+            )
+
+            # Détail par valeur exclue
+            for exclude_val in exclude_vals:
+                count = counts_before.get(str(exclude_val).lower(), 0)
+                percentage = (count / before_n * 100) if before_n > 0 else 0
+                logger.info(
+                    f"   └── '{exclude_val}': {count:,} rows ({percentage:.2f}%)"
+                )
+
+        except Exception as e:
+            logger.warning(f"Error in exclusion analysis: {e}")
+
         mask_excl = target_lower.isin(exclude_lower)
         df = df.loc[~mask_excl].reset_index(drop=True)
         removed_n = before_n - len(df)
+
         # Log counts AFTER filtering
-        remaining_after = int(df[target_col].astype(str).str.lower().isin(exclude_lower).sum())
-        logger.info(
-            f"Excluded {removed_n} rows by target filter {exclude_vals}; remaining excluded-class rows after filter = {remaining_after}"
+        remaining_after = int(
+            df[target_col].astype(str).str.lower().isin(exclude_lower).sum()
         )
+
+        if config["runtime"]["verbose"]:
+            logger.info(
+                f"✅ EXCLUSION COMPLETE - Removed {removed_n:,} rows ({removed_n / before_n * 100:.2f}%)"
+            )
+            logger.info(f"📋 Remaining rows: {len(df):,}")
+
+            if remaining_after > 0:
+                logger.warning(
+                    f"⚠️  Still {remaining_after} excluded values remaining (should be 0!)"
+                )
+            else:
+                logger.info(
+                    f"✨ SUCCESS: All '{exclude_vals}' values successfully excluded!"
+                )
+
         if len(df) == 0:
-            raise ValueError(f"No samples left after excluding target values: {exclude_vals}")
-        
-        
-        
-        
-        
+            raise ValueError(
+                f"No samples left after excluding target values: {exclude_vals}"
+            )
+
         removed_n = before_n - len(df)
         if config["runtime"]["verbose"]:
             logger.info(f"Excluded {removed_n} rows by target filter: {exclude_vals}")
@@ -768,7 +796,7 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
     # encoder = LabelEncoder()
     # targets = encoder.fit_transform(df[target_col])
     # target_vocab_size = len(encoder.classes_)
-    
+
     encoder = LabelEncoder()
     targets = encoder.fit_transform(df[target_col])
     target_vocab_size = len(encoder.classes_)
@@ -776,11 +804,17 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
     try:
         if len(exclude_vals) > 0:
             present_classes_lower = {str(c).lower() for c in encoder.classes_}
-            still_present = present_classes_lower.intersection({str(v).lower() for v in exclude_vals})
+            still_present = present_classes_lower.intersection(
+                {str(v).lower() for v in exclude_vals}
+            )
             if still_present:
-                logger.warning(f"Excluded target values still present in classes after encoding: {still_present}")
+                logger.warning(
+                    f"Excluded target values still present in classes after encoding: {still_present}"
+                )
             else:
-                logger.info(f"Excluded target values removed from dataset and label space: {exclude_vals}")
+                logger.info(
+                    f"Excluded target values removed from dataset and label space: {exclude_vals}"
+                )
         logger.info(f"Target classes after filtering & encoding: {target_vocab_size}")
     except Exception:
         pass
@@ -847,7 +881,7 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
 
     # Convert to tensors (handle pandas Series properly)
     train_batch = {}
-    val_batch = {} # contient toutes les features de validation ( pas de batching)
+    val_batch = {}  # contient toutes les features de validation ( pas de batching)
     for col in seq_cols_filtered + cat_cols_filtered:
         # Convert pandas Series to numpy arrays first
         train_values = (
@@ -877,8 +911,7 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
             val_batch[col] = torch.tensor(val_values_int, dtype=torch.long)
         else:  # categorical
             # For categorical features, ensure they're within vocab range
-            
-           
+
             train_values_int = np.clip(train_values.astype(int), 0, vocab_size - 1)
             val_values_int = np.clip(val_values.astype(int), 0, vocab_size - 1)
             train_batch[col] = torch.tensor(train_values_int, dtype=torch.long)
@@ -894,9 +927,13 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
                     f"Categorical {col}: train_range=[{train_values_int.min()}, {train_values_int.max()}], vocab_size={vocab_size}"
                 )
 
-    #INPUT 2
-    train_targets_tensor = torch.tensor(train_targets, dtype=torch.long) # input2 (labels /targets) : sont les vrai class pour chaque sample
-    val_targets_tensor = torch.tensor(val_targets, dtype=torch.long) # input2 (labels /targets) : sont les vrai class pour chaque sample
+    # INPUT 2
+    train_targets_tensor = torch.tensor(
+        train_targets, dtype=torch.long
+    )  # input2 (labels /targets) : sont les vrai class pour chaque sample
+    val_targets_tensor = torch.tensor(
+        val_targets, dtype=torch.long
+    )  # input2 (labels /targets) : sont les vrai class pour chaque sample
 
     # Update config with filtered columns for model creation
     config["features"]["sequence_cols"] = seq_cols_filtered
@@ -919,10 +956,10 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
     # Training loop
     num_epochs = config["training"]["num_epochs"]
     history = []
-    
-    #loss function
+
+    # loss function
     # 1) definition de la regle ( moyenne - log proba vraie classe)
-    loss_fn = torch.nn.CrossEntropyLoss() # reduction pa default = moyenne
+    loss_fn = torch.nn.CrossEntropyLoss()  # reduction pa default = moyenne
     # mesure l'ecart entre les predic de la class multi classes et les vrai class
 
     if config["runtime"]["progress"] and _HAS_TQDM:
@@ -932,34 +969,41 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
 
     for epoch in range(num_epochs):
         # Training
-        model.train() # mode entrainement dropout actid
+        model.train()  # mode entrainement dropout actid
         optimizer.zero_grad()
 
-        #EVALUONS LA LOSS SUR L'ENSEMBLE D'ENTRAINEMENT
-        
-        #INPUT 1 
-        train_outputs = model(train_batch) # 3: logits sur le batch d'entrainement [batch_size, n_classes]
-        
-        #OUTPUT
-        #output : ( scalair loss) :
-        train_loss = loss_fn(train_outputs, train_targets_tensor) # 4: erreur d'ntrainement loss = moyenne de la cross entropy entre train_outputs et train_targets_tensor
-        train_loss.backward() # 5:calcul des gradients
-        optimizer.step() # 6) mise à jour des poids c
+        # EVALUONS LA LOSS SUR L'ENSEMBLE D'ENTRAINEMENT
+
+        # INPUT 1
+        train_outputs = model(
+            train_batch
+        )  # 3: logits sur le batch d'entrainement [batch_size, n_classes]
+
+        # OUTPUT
+        # output : ( scalair loss) :
+        train_loss = loss_fn(
+            train_outputs, train_targets_tensor
+        )  # 4: erreur d'ntrainement loss = moyenne de la cross entropy entre train_outputs et train_targets_tensor
+        train_loss.backward()  # 5:calcul des gradients
+        optimizer.step()  # 6) mise à jour des poids c
 
         # Validation
-        model.eval() # 7 : mode evaluation pas de dropout
-        with torch.no_grad(): # 8 : pas de gradient on n'apprends pas
-            
-            #INPUT 1
-            val_outputs = model(val_batch) # 9: logits sur la validation, input1 (logits) :sont des logits sur toutes les classes
-            
-            #Output ( scalair loss) :
-            val_loss = loss_fn(val_outputs, val_targets_tensor) # 10 : erreur valid ( pour mesurer )
-            # calculée en evaluation sur tout le set de valdation d'un coup 
+        model.eval()  # 7 : mode evaluation pas de dropout
+        with torch.no_grad():  # 8 : pas de gradient on n'apprends pas
+            # INPUT 1
+            val_outputs = model(
+                val_batch
+            )  # 9: logits sur la validation, input1 (logits) :sont des logits sur toutes les classes
+
+            # Output ( scalair loss) :
+            val_loss = loss_fn(
+                val_outputs, val_targets_tensor
+            )  # 10 : erreur valid ( pour mesurer )
+            # calculée en evaluation sur tout le set de valdation d'un coup
             # je ne fais pas de mini batches en val, je passe tout d'un coup
 
             # Calculate accuracy
-            val_predictions = torch.argmax(val_outputs, dim=1) # accuracy
+            val_predictions = torch.argmax(val_outputs, dim=1)  # accuracy
             val_accuracy = (val_predictions == val_targets_tensor).float().mean().item()
 
         history.append(
@@ -1040,9 +1084,15 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
 
             # Save predictions dataset with business details
             if outputs_config.get("predictions_dataset"):
-                # Get class to product mapping (assuming target classes are product IDs)
-                unique_targets = np.unique(true_labels)
-                target_vocab = {i: f"PRODUIT_{i}" for i in unique_targets}
+                # Créer le mapping des vrais noms de produits depuis le dataset original
+                original_target_values = df[target_col].unique()
+
+                # Mapping inverse : encoded_class -> original_product_name
+                inverse_target_mapping = {}
+                for encoded_class, original_name in zip(
+                    encoder.transform(original_target_values), original_target_values
+                ):
+                    inverse_target_mapping[encoded_class] = str(original_name)
 
                 # Create detailed predictions DataFrame
                 predictions_list = []
@@ -1052,16 +1102,21 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
                     # Get top 5 predictions
                     top5_indices = np.argsort(pred_scores)[-5:][::-1]
                     top5_scores = pred_scores[top5_indices]
+
+                    # Utiliser les vrais noms de produits
                     top5_products = [
-                        target_vocab.get(i, f"PRODUIT_{i}") for i in top5_indices
+                        inverse_target_mapping.get(i, f"UNKNOWN_PRODUCT_{i}")
+                        for i in top5_indices
                     ]
 
-                    # Main prediction
+                    # Main prediction avec vrai nom
                     predicted_class = np.argmax(pred_scores)
-                    predicted_product = target_vocab.get(
-                        predicted_class, f"PRODUIT_{predicted_class}"
+                    predicted_product_name = inverse_target_mapping.get(
+                        predicted_class, f"UNKNOWN_PRODUCT_{predicted_class}"
                     )
-                    true_product = target_vocab.get(true_class, f"PRODUIT_{true_class}")
+                    true_product_name = inverse_target_mapping.get(
+                        true_class, f"UNKNOWN_PRODUCT_{true_class}"
+                    )
 
                     # Prediction result
                     prediction_correct = predicted_class == true_class
@@ -1070,33 +1125,33 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
                     predictions_list.append(
                         {
                             "client_id": idx + 1,
-                            "predicted_product": predicted_product,
                             "predicted_product_id": int(predicted_class),
-                            "true_product": true_product,
+                            "predicted_product_name": predicted_product_name,  # ✅ NOUVEAU
                             "true_product_id": int(true_class),
+                            "true_product_name": true_product_name,  # ✅ NOUVEAU
                             "prediction_correct": prediction_correct,
                             "confidence_score": float(confidence_score),
-                            "top1_product": top5_products[0],
+                            "top1_product_name": top5_products[0],  # ✅ AMÉLIORÉ
                             "top1_score": float(top5_scores[0]),
-                            "top2_product": top5_products[1]
+                            "top2_product_name": top5_products[1]
                             if len(top5_products) > 1
                             else None,
                             "top2_score": float(top5_scores[1])
                             if len(top5_scores) > 1
                             else None,
-                            "top3_product": top5_products[2]
+                            "top3_product_name": top5_products[2]
                             if len(top5_products) > 2
                             else None,
                             "top3_score": float(top5_scores[2])
                             if len(top5_scores) > 2
                             else None,
-                            "top4_product": top5_products[3]
+                            "top4_product_name": top5_products[3]
                             if len(top5_products) > 3
                             else None,
                             "top4_score": float(top5_scores[3])
                             if len(top5_scores) > 3
                             else None,
-                            "top5_product": top5_products[4]
+                            "top5_product_name": top5_products[4]
                             if len(top5_products) > 4
                             else None,
                             "top5_score": float(top5_scores[4])
@@ -1155,7 +1210,7 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
                 if len(prediction_scores) > 0:
                     logger.info("Calculating Top-K metrics for metrics dataset...")
                     k_values = [1, 3, 5, 10]
-                    topk_metrics = evaluate_topk_metrics(
+                    topk_metrics = evaluate_topk_metrics_advanced(
                         predictions=prediction_scores,
                         targets=true_labels,
                         k_values=k_values,
@@ -1264,59 +1319,112 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # Top-K evaluation functions
-def evaluate_topk_metrics(predictions=None, targets=None, k_values=[1, 3, 4]):
-    """Evaluate Top-K metrics using real T4Rec predictions with NDCG and Hit Rate"""
+def evaluate_topk_metrics_advanced(
+    predictions=None,
+    targets=None,
+    client_ids=None,
+    product_names=None,
+    k_values=[1, 3, 5],
+):
+    """
+    Evaluate Top-K metrics using sklearn (compatible avec votre collègue)
+    Calcule les métriques par client puis moyenne globale
+    """
+    from sklearn.metrics import ndcg_score, average_precision_score
+    from collections import defaultdict
+
     if predictions is None or targets is None:
         raise ValueError("Real predictions and targets are required")
+
+    # Si pas de client_ids, créer des IDs séquentiels
+    if client_ids is None:
+        client_ids = np.arange(len(predictions))
+
+    # Si pas de product_names, utiliser les indices
+    if product_names is None:
+        product_names = np.arange(len(predictions[0]) if len(predictions) > 0 else 0)
+
+    client_data = defaultdict(list)
+
+    # Grouper par client (adaptation de l'algo de votre collègue)
+    for cid, pred_logits, target in zip(client_ids, predictions, targets):
+        # Convertir logits en scores (softmax)
+        scores = np.exp(pred_logits) / np.sum(np.exp(pred_logits))
+
+        # Ajouter chaque produit avec son score et label
+        for prod_idx, score in enumerate(scores):
+            label = 1.0 if prod_idx == target else 0.0
+            client_data[cid].append((label, score, prod_idx))
 
     metrics_by_k = {}
 
     for k in k_values:
-        precisions = []
-        recalls = []
-        f1_scores = []
-        ndcgs = []
-        hit_rates = []
+        ndcgs, aps, recalls, f1s = [], [], [], []
+        hit_count = 0
+        recommended_products = set()
+        precision_topk_total = 0
+        topk_count = 0
+        valid_clients = 0
 
-        # Loop through each prediction and target pair
-        for pred_logits, target in zip(predictions, targets):
-            # Get the top k predictions
-            top_k_indices = np.argsort(pred_logits)[-k:][::-1]
-            top_k_preds = set(top_k_indices)
+        for cid, items in client_data.items():
+            y_true = np.array([l for l, _, _ in items], dtype=float)
+            y_score = np.array([s for _, s, _ in items], dtype=float)
+            y_prods = np.array([p for _, _, p in items])
 
-            target_set = {target}
-            intersection = top_k_preds.intersection(target_set)
+            # Skip clients sans label positif (comme votre collègue)
+            if y_true.sum() == 0 or len(y_true) < 2 or np.isnan(y_score).any():
+                continue
 
-            # Calculate precision
-            precision = len(intersection) / k
-            # Calculate recall
-            recall = len(intersection) / len(target_set)
+            valid_clients += 1
 
-            # Calculate F1 score if precision and recall are not zero
-            if precision + recall > 0:
-                f1 = 2 * (precision * recall) / (precision + recall)
+            # Top-K indices
+            top_k_idx = np.argsort(y_score)[::-1][:k]
+            y_topk = y_true[top_k_idx]
+            p_topk = y_prods[top_k_idx]
+
+            # Precision@K globale
+            precision_topk_total += y_topk.sum()
+            topk_count += k
+
+            # Métriques par client (sklearn)
+            try:
+                ndcgs.append(ndcg_score([y_true], [y_score], k=k))
+                aps.append(average_precision_score(y_true, y_score))
+            except:
+                # Fallback si sklearn échoue
+                ndcgs.append(0.0)
+                aps.append(0.0)
+
+            # Recall@K
+            recall_at_k = y_topk.sum() / y_true.sum()
+            recalls.append(recall_at_k)
+
+            # F1@K
+            prec_k = y_topk.sum() / k
+            rec_k = recall_at_k
+            if prec_k + rec_k > 0:
+                f1s.append(2 * (prec_k * rec_k) / (prec_k + rec_k))
             else:
-                f1 = 0.0
+                f1s.append(0.0)
 
-            # Calculate NDCG@K
-            ndcg = _calculate_ndcg_at_k(pred_logits, target, k)
+            # Hit Rate
+            if y_topk.sum() > 0:
+                hit_count += 1
 
-            # Calculate Hit Rate@K (binary: 1 if target in top-k, 0 otherwise)
-            hit_rate = 1.0 if target in top_k_preds else 0.0
+            recommended_products.update(p_topk)
 
-            precisions.append(precision)
-            recalls.append(recall)
-            f1_scores.append(f1)
-            ndcgs.append(ndcg)
-            hit_rates.append(hit_rate)
-
-        # Store the calculated metrics for each k value
+        # Calcul final des métriques
         metrics_by_k[k] = {
-            "precision": np.mean(precisions),
-            "recall": np.mean(recalls),
-            "f1": np.mean(f1_scores),  # Changé f1_score -> f1 pour compatibilité
-            "ndcg": np.mean(ndcgs),
-            "hit_rate": np.mean(hit_rates),
+            "precision": precision_topk_total / topk_count if topk_count > 0 else 0.0,
+            "recall": np.mean(recalls) if recalls else 0.0,
+            "f1": np.mean(f1s) if f1s else 0.0,
+            "ndcg": np.mean(ndcgs) if ndcgs else 0.0,
+            "map": np.mean(aps) if aps else 0.0,  # Mean Average Precision
+            "hit_rate": hit_count / valid_clients if valid_clients > 0 else 0.0,
+            "coverage": len(recommended_products) / len(set(product_names))
+            if len(product_names) > 0
+            else 0.0,
+            "clients_evaluated": valid_clients,
         }
 
     return metrics_by_k
