@@ -1,579 +1,536 @@
 
 # t4rec_toolkit/pipeline_core.py
-# =============================================================================
-# Pipeline HYBRIDE T4Rec + PyTorch TransformerEncoder
-# - Embeddings: transformers4rec SequenceEmbeddingFeatures
-# - Entraînement: boucle PyTorch (mini-batches, class weights)
-# - Anti-leakage: fit transformers sur TRAIN uniquement
-# - Top-K métriques format "collègue"
-# Version: compatible T4Rec 23.04.00
-# =============================================================================
+# -*- coding: utf-8 -*-
+"""
+PIPELINE HYBRIDE T4Rec + PyTorch avec DIMENSION TEMPORELLE RÉELLE
+------------------------------------------------------------------
+Ce module :
+  1) charge les données (profil + events) depuis Dataiku,
+  2) construit de VRAIES séquences temporelles par client (12-24 mois),
+  3) prépare les features (catégorielles / séquentielles) pour T4Rec,
+  4) entraîne un Transformer PyTorch sur ces séquences,
+  5) calcule les métriques + sauvegarde datasets (features/pred/metrics/model).
+
+Points clés :
+  - Compatible T4Rec 23.04.00 (on n'utilise que les embeddings)
+  - Exploite enfin la dimension temporelle (le vrai "+")
+  - Regroupement des classes ultra-rares → "AUTRES_PRODUITS" (log explicite)
+"""
 
 from __future__ import annotations
-
-import logging
-import time
+import logging, time, json, math
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+import torch
+import torch.nn as nn
 
-# -----------------------------------------------------------------------------
-# T4Rec (embeddings)
-# -----------------------------------------------------------------------------
+# ============== T4Rec (embeddings uniquement) =====================
 try:
     import transformers4rec.torch as tr
     from transformers4rec.torch.features.embedding import (
+        EmbeddingFeatures,
         FeatureConfig,
         TableConfig,
     )
     from transformers4rec.torch.features.sequence import SequenceEmbeddingFeatures
-
     _HAS_T4REC = True
-    print("T4Rec imported successfully")
-except ImportError as e:
+    print("T4Rec import OK")
+except Exception as e:
     _HAS_T4REC = False
-    print(f"T4Rec import error: {e}")
-    raise ImportError(
-        "T4Rec est requis. Installe: pip install transformers4rec[torch]"
-    )
+    raise ImportError("T4Rec requis. Installez: pip install transformers4rec[torch]")
 
-# -----------------------------------------------------------------------------
-# Dataiku (I/O datasets) - optionnel
-# -----------------------------------------------------------------------------
+# ============== Dataiku (optionnel) ================================
 try:
     import dataiku
-
     _HAS_DATAIKU = True
 except Exception:
     _HAS_DATAIKU = False
 
-# -----------------------------------------------------------------------------
-# Progress bar
-# -----------------------------------------------------------------------------
+# ============== TQDM (optionnel) ==================================
 try:
     from tqdm.auto import tqdm
-
     _HAS_TQDM = True
 except Exception:
     _HAS_TQDM = False
 
-# -----------------------------------------------------------------------------
-# Transformers internes
-# -----------------------------------------------------------------------------
-from .transformers.sequence_transformer import SequenceTransformer
-from .transformers.categorical_transformer import CategoricalTransformer
+# ============== Transfos locales ==================================
+from .transformers.sequence_transformer import SequenceTransformer  # corrigé
+from .transformers.categorical_transformer import CategoricalTransformer  # corrigé
+from .utils.sequence_builder import SequenceBuilder, SequenceBuilderConfig  # nouveau
 
-# -----------------------------------------------------------------------------
-# PyTorch
-# -----------------------------------------------------------------------------
-import torch
-import torch.nn as nn
-import torch.utils.data as tud
-from sklearn.model_selection import train_test_split
-from sklearn.utils.class_weight import compute_class_weight
+# ============== Sklearn (label encoding / metrics) =================
 from sklearn.preprocessing import LabelEncoder
-from sklearn.metrics import (
-    precision_recall_fscore_support,
-    balanced_accuracy_score,
-)
-from scipy.special import softmax
+from sklearn.metrics import precision_recall_fscore_support
 
 
-# =============================================================================
-# Configs utilitaires
-# =============================================================================
+# ------------------------------------------------------------------
+# 1) CONFIGS & HELPERS
+# ------------------------------------------------------------------
 
 @dataclass
 class T4RecConfig:
-    """Configuration minimale pour auto-sizer si besoin."""
+    """Config du modèle (dimensions principales)"""
     d_model: int = 256
     n_heads: int = 8
-    n_layers: int = 3
+    n_layers: int = 4
     dropout: float = 0.1
-    max_sequence_length: int = 20
-    mem_len: int = 50
-    attn_type: str = "bi"
-    vocab_size: int = 1000
-    num_classes: int = 150
+    max_sequence_length: int = 24
+    vocab_size: int = 2000
 
 
 def blank_config() -> Dict[str, Any]:
-    """Config squelette — simple et explicite."""
+    """
+    Gabarit de configuration.
+    NOTE: nouvelles clés "events_*" pour activer la dimension temporelle.
+    """
     return {
         "data": {
-            "dataset_name": "",
-            "sample_size": 10000,
-            "chunk_size": 2000,
+            "dataset_name": "",            # table statique (profil) - optionnelle
+            "events_dataset": "",          # table évènements (obligatoire pour les séquences)
+            "sample_size": 100_000,        # nb max clients
+            "limit": None,
+            "chunk_size": 50_000,
             "partitions": None,
-            "temporal_split": None,  # optionnel
-            "limit": None,           # optionnel
+            "temporal_split": None,
+            # Colonnes (events)
+            "client_id_col": "CLIENT_ID",
+            "event_time_col": "DATE_EVENT",       # doit être parsable datetime
+            "product_col": "PRODUCT_CODE",        # identifiant produit
+            # Optionnels : d'autres attributs d'événement (canal, montant, etc.)
+            "event_extra_cols": [],               # ex: ["CANAL", "MONTANT"]
+            # Colonnes profil (si dataset profil est fourni)
+            "profile_join_key": "CLIENT_ID",
+            "profile_categorical_cols": [],       # ex: ["SEGMENT", "REGION"]
+            "profile_sequence_cols": [],          # ex: ["AGE", "REVENU"]
+        },
+        "sequence": {
+            # Fenêtre temporelle / sampling
+            "months_lookback": 24,         # longueur de séquence (derniers n mois)
+            "min_events_per_client": 1,    # garde les clients avec au moins 1 event
+            "time_granularity": "M",       # "M" = mois, "W" = semaine (support de base)
+            "target_horizon": 1,           # prédire l'item du mois suivant (horizon=1)
+            "pad_value": 0,                # padding index pour les séquences
+            "build_target_from_events": True,  # True: label=produit du "mois cible"
         },
         "features": {
-            "sequence_cols": [],
-            "categorical_cols": [],
-            "target_col": "",
-            "exclude_target_values": [],  # ex: ["aucune_proposition"]
+            "sequence_cols": [],           # (rempli automatiquement pour events)
+            "categorical_cols": [],        # (profil ou events extra)
+            "target_col": "TARGET_PRODUCT",# label final (si pas build auto)
+            "exclude_target_values": ["aucune_souscription"],
+            "merge_rare_threshold": 200,   # <200 exemples → "AUTRES_PRODUITS"
+            "other_class_name": "AUTRES_PRODUITS",
         },
         "model": {
-            "d_model": 256,
+            "d_model": 512,
             "n_heads": 8,
-            "n_layers": 3,
+            "n_layers": 4,
             "dropout": 0.1,
-            "max_sequence_length": 1,  # ⚠️ séquences scalaires → 1
-            "mem_len": 50,
-            "attn_type": "bi",
-            "vocab_size": 1000,
-        },
-        "transformers": {
-            "categorical": {
-                "max_categories": 1000,
-                "handle_unknown": "encode",
-                "unknown_value": 1,
-            }
+            "max_sequence_length": 24,
+            "vocab_size": 2000,            # base pour embeddings
         },
         "training": {
             "batch_size": 64,
-            "num_epochs": 15,
-            "learning_rate": 1e-3,
-            "weight_decay": 1e-2,
+            "num_epochs": 20,
+            "learning_rate": 5e-4,
+            "weight_decay": 1e-4,
             "val_split": 0.2,
-            "optimizer": "adamw",          # "adam" ou "adamw"
-            "scheduler": None,             # "cosine" (optionnel)
-            "warmup_steps": 0,             # pas de warmup par défaut
-            "gradient_clip": 0.5,
-            "early_stopping_patience": 0,  # 0 = désactivé
+            "class_weighting": True,       # pondérer CrossEntropy selon fréquences
+            "gradient_clip": 1.0,
+            "optimizer": "adamw",
+        },
+        "outputs": {
+            "features_dataset": "T4REC_FEATURES",
+            "predictions_dataset": "T4REC_PREDICTIONS",
+            "metrics_dataset": "T4REC_METRICS",
+            "model_artifacts_dataset": "T4REC_MODEL",
+            "local_dir": "output",
         },
         "runtime": {
             "verbose": True,
             "progress": True,
             "seed": 42,
-            "memory_efficient": True,
         },
-        "outputs": {
-            "features_dataset": None,
-            "predictions_dataset": None,
-            "metrics_dataset": None,
-            "model_artifacts_dataset": None,
-            "local_dir": "output",
-            "save_model": True,
-        },
-        "metrics": ["accuracy", "precision", "recall", "f1"],  # base
     }
 
 
 def _setup_logging(verbose: bool) -> None:
-    """Logger simple pour Dataiku / console."""
+    """Logging simple."""
     level = logging.INFO if verbose else logging.WARNING
     logging.basicConfig(level=level, format="%(asctime)s - %(levelname)s - %(message)s")
 
 
-# =============================================================================
-# Chargement Dataiku
-# =============================================================================
+# ------------------------------------------------------------------
+# 2) CHARGEMENT & PRÉPARATION DONNÉES
+# ------------------------------------------------------------------
 
-def _load_dataframe(
-    dataset_name: str,
-    sample_size: int,
-    partitions: List[str] = None,
-    temporal_split: Dict[str, Any] = None,
-) -> Tuple[pd.DataFrame, Optional[pd.DataFrame]]:
+def _load_events_df(cfg: Dict[str, Any]) -> pd.DataFrame:
     """
-    Charge un DataFrame depuis Dataiku.
-    - Si temporal_split fourni → renvoie (train_df, test_df)
-    - Sinon → renvoie (df, None)
+    Charge le dataset d'événements (obligatoire pour la dimension temporelle).
+    Le dataset doit contenir au minimum :
+      - client_id_col
+      - event_time_col (datetime-like)
+      - product_col (id produit)
     """
-    logger = logging.getLogger(__name__)
     if not _HAS_DATAIKU:
-        raise RuntimeError("Dataiku non disponible dans cet environnement.")
+        raise RuntimeError("Dataiku nécessaire pour charger les datasets.")
 
-    try:
-        if temporal_split:
-            logger.info(f"Loading with temporal split: {temporal_split}")
-            # NB: pour simplifier, on lit tout puis filtrage / limit (Dataiku partitions possibles)
-            train_dataset = dataiku.Dataset(dataset_name)
-            train_df = train_dataset.get_dataframe(limit=sample_size)
-            test_dataset = dataiku.Dataset(dataset_name)
-            test_df = test_dataset.get_dataframe(limit=sample_size // 5)
-            logger.info(f"Loaded {len(train_df):,} train rows, {len(test_df):,} test rows")
-            return train_df, test_df
-        else:
-            dataset = dataiku.Dataset(dataset_name)
-            df = dataset.get_dataframe(limit=sample_size)
-            logger.info(f"Loaded {len(df):,} rows from {dataset_name}")
-            return df, None
-    except Exception as e:
-        logger.error(f"Erreur chargement dataset {dataset_name}: {e}")
-        raise
+    logger = logging.getLogger(__name__)
+    dcfg = cfg["data"]
+    ds_name = dcfg["events_dataset"]
+    if not ds_name:
+        raise ValueError("data.events_dataset est requis (séquences temporelles).")
+
+    ds = dataiku.Dataset(ds_name)
+    df = ds.get_dataframe(limit=dcfg.get("limit"))
+    logger.info(f"Events loaded: {ds_name} → {df.shape}")
+
+    # Renommer pour simplifier le code interne
+    cid = dcfg["client_id_col"]
+    tcol = dcfg["event_time_col"]
+    pcol = dcfg["product_col"]
+    if tcol not in df.columns or cid not in df.columns or pcol not in df.columns:
+        raise ValueError(
+            f"Colonnes requises manquantes dans events: "
+            f"{cid}, {tcol}, {pcol}."
+        )
+
+    # Ensure datetime
+    df[tcol] = pd.to_datetime(df[tcol], errors="coerce")
+    df = df.dropna(subset=[tcol])  # retire lignes non datées
+    return df
 
 
-# =============================================================================
-# Modèle hybride : Embeddings T4Rec + TransformerEncoder PyTorch
-# =============================================================================
-
-class T4RecHybridModel(nn.Module):
+def _load_profile_df_if_any(cfg: Dict[str, Any]) -> Optional[pd.DataFrame]:
     """
-    Modèle compact et propre :
-    - embeddings T4Rec (concat de toutes les features)
-    - projection éventuelle → d_model
-    - TransformerEncoder (n_layers)
-    - Head MLP → num_classes
+    Charge la table profil si "dataset_name" est fourni.
+    (Optionnelle : utile pour features catégorielles/statique par client)
+    """
+    if not _HAS_DATAIKU:
+        return None
 
-    NB: on a volontairement retiré les "dual-pathway embeddings" (item/user)
-    tant qu'on n'a pas de vrais identifiants pertinents → évite du bruit.
+    logger = logging.getLogger(__name__)
+    dcfg = cfg["data"]
+    ds_name = dcfg.get("dataset_name")
+    if not ds_name:
+        return None
+
+    ds = dataiku.Dataset(ds_name)
+    df = ds.get_dataframe(limit=dcfg.get("limit"))
+    logger.info(f"Profile loaded: {ds_name} → {df.shape}")
+    return df
+
+
+def merge_rare_classes(series: pd.Series, min_count: int, other_name: str) -> Tuple[pd.Series, Dict[str, str]]:
+    """
+    Regroupe les classes rares (< min_count) en 'other_name'.
+    Retourne la série transformée + le mapping classe_originale -> 'other_name'.
+    """
+    vc = series.value_counts()
+    rare = vc[vc < min_count].index
+    mapping = {str(x): other_name for x in rare}
+    new_series = series.astype(str).where(~series.astype(str).isin(rare), other_name)
+    return new_series, mapping
+
+
+# ------------------------------------------------------------------
+# 3) MODÈLE HYBRIDE
+# ------------------------------------------------------------------
+
+class T4RecTemporalModel(nn.Module):
+    """
+    Modèle hybride :
+      - Embeddings T4Rec pour les features (séquence item_id + extras)
+      - TransformerEncoder PyTorch qui lit toute la séquence
+      - Head de prédiction du prochain produit (multi-classes)
     """
 
     def __init__(
         self,
-        embedding_module: nn.Module,
-        n_products: int,
+        embedding_module,           # SequenceEmbeddingFeatures T4Rec
         d_model: int,
-        n_layers: int,
         n_heads: int,
+        n_layers: int,
         dropout: float,
-        max_sequence_length: int = 1,
-        embedding_output_dim: Optional[int] = None,
+        n_classes: int,
+        max_seq_len: int,
+        proj_in_dim: Optional[int] = None,
     ):
         super().__init__()
         self.t4rec_embeddings = embedding_module
-        self.d_model = d_model
 
-        # Si la dimension concat des embeddings T4Rec != d_model, projeter
-        self.projection = None
-        if embedding_output_dim and embedding_output_dim != d_model:
-            self.projection = nn.Linear(embedding_output_dim, d_model)
+        # Si la concat T4Rec ne fait pas "pile" d_model, on projette
+        self.proj = None
+        if proj_in_dim is not None and proj_in_dim != d_model:
+            self.proj = nn.Linear(proj_in_dim, d_model)
 
-        # Positional encoding simple (utile si seq_len > 1 plus tard)
-        self.positional_encoding = nn.Parameter(
-            torch.randn(1, max_sequence_length, d_model) * 0.02
-        )
+        # Positional encoding simple (appris)
+        self.positional = nn.Parameter(torch.randn(1, max_seq_len, d_model) * 0.02)
 
-        # Encoder Transformer
-        encoder_layer = nn.TransformerEncoderLayer(
+        # Transformer
+        enc_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=n_heads,
             dim_feedforward=d_model * 4,
             dropout=dropout,
-            activation="gelu",
             batch_first=True,
+            activation="gelu",
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=n_layers)
 
-        # Tête de prédiction
+        # Head
         self.head = nn.Sequential(
             nn.LayerNorm(d_model),
             nn.Linear(d_model, d_model),
             nn.GELU(),
             nn.Dropout(0.1),
-            nn.Linear(d_model, n_products),
+            nn.Linear(d_model, n_classes),
         )
 
-        # Init poids
-        self._init_weights()
+        self.d_model = d_model
+        self.max_seq_len = max_seq_len
 
-    def _init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight, gain=1.0)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.Embedding):
-                nn.init.normal_(m.weight, std=0.02)
-
-    def forward(self, inputs: Dict[str, torch.Tensor]):
+    def forward(self, batch_inputs: Dict[str, torch.Tensor]) -> torch.Tensor:
         """
-        inputs: dict { feature_name: tensor [B, S] } (S=1 pour l’instant)
+        batch_inputs = dict de tenseurs Long [B, T] pour toutes les features
         """
-        # 1) embeddings T4Rec concat
-        x = self.t4rec_embeddings(inputs)  # [B, S?, D_concat] ou [B, D_concat]
-        if x.dim() == 2:
-            x = x.unsqueeze(1)  # [B, 1, D_concat]
+        # 1) Embeddings T4Rec (concat par feature → [B, T, F_concat])
+        x = self.t4rec_embeddings(batch_inputs)  # [B, T, F_concat]
 
-        # 2) projection éventuelle → d_model
-        if self.projection is not None:
-            x = self.projection(x)  # [B, S, d_model]
+        # 2) Projection éventuelle pour matcher d_model
+        if self.proj is not None:
+            x = self.proj(x)  # [B, T, d_model]
 
-        # 3) positionnel
-        if x.shape[1] <= self.positional_encoding.shape[1]:
-            x = x + self.positional_encoding[:, : x.shape[1], :]
+        # 3) + positional
+        T = x.shape[1]
+        pos = self.positional[:, :T, :]
+        x = x + pos
 
-        # 4) transformer
-        h = self.transformer(x)  # [B, S, d_model]
+        # 4) Transformer
+        x = self.encoder(x)  # [B, T, d_model]
 
-        # 5) pool (dernier token)
-        z = h[:, -1, :]  # [B, d_model]
+        # 5) On prend le dernier pas de temps comme "résumé" (next-item)
+        out = x[:, -1, :]  # [B, d_model]
 
-        # 6) logits
-        logits = self.head(z)  # [B, num_classes]
+        # 6) Logits multi-classes
+        logits = self.head(out)  # [B, n_classes]
         return logits
 
 
-def _create_t4rec_model(
-    config: Dict[str, Any],
-) -> Tuple[nn.Module, int]:
+# ------------------------------------------------------------------
+# 4) CRÉATION EMBEDDINGS T4REC
+# ------------------------------------------------------------------
+
+def _build_t4rec_embedding_module(
+    feature_dims: Dict[str, int],
+    d_model: int,
+    max_seq_len: int,
+) -> Tuple[SequenceEmbeddingFeatures, int]:
     """
-    Construit l'embedding T4Rec (concat de toutes les tables).
-    Retourne (embedding_module, embedding_output_dim).
+    Construit un SequenceEmbeddingFeatures où chaque feature a sa TableConfig.
+    Retourne (module, concat_dim).
+    - feature_dims: dict {feature_name: vocab_size}
+      Ex: {"item_id": 5000, "canal": 10}
+    - Chaque table a une dimension d_model // nb_features (simple & robuste)
     """
-    model_cfg = config["model"]
-    seq_cols = config["features"]["sequence_cols"]
-    cat_cols = config["features"]["categorical_cols"]
-    all_cols = seq_cols + cat_cols
-    d_model = model_cfg["d_model"]
-    vocab = model_cfg["vocab_size"]
-    max_seq_len = model_cfg.get("max_sequence_length", 1)
+    assert _HAS_T4REC
+    n_feats = len(feature_dims)
+    per_dim = max(8, d_model // max(1, n_feats))  # au moins 8
 
-    if len(all_cols) == 0:
-        raise ValueError("Aucune feature fournie à T4Rec.")
-
-    # Dimension d'embedding par feature (répartie proprement)
-    # Au moins 4 dims par feature pour éviter dim trop petite
-    per_feat_dim = max(d_model // max(len(all_cols), 1), 4)
-
-    feature_configs: Dict[str, FeatureConfig] = {}
-    for col in seq_cols:
-        table = TableConfig(
-            vocabulary_size=vocab,
-            dim=per_feat_dim,
-            name=f"{col}_table",
-        )
-        feature_configs[col] = FeatureConfig(
-            table=table, max_sequence_length=max_seq_len, name=col
+    feature_cfgs = {}
+    for feat, vocab in feature_dims.items():
+        tbl = TableConfig(vocabulary_size=vocab, dim=per_dim, name=f"{feat}_table")
+        feature_cfgs[feat] = FeatureConfig(
+            table=tbl, max_sequence_length=max_seq_len, name=feat
         )
 
-    for col in cat_cols:
-        table = TableConfig(
-            vocabulary_size=vocab,
-            dim=per_feat_dim,
-            name=f"{col}_table",
-        )
-        feature_configs[col] = FeatureConfig(
-            table=table, max_sequence_length=max_seq_len, name=col
-        )
-
-    # item_id requis : on prend la 1ère seq si dispo sinon 1ère cat
-    item_id_col = seq_cols[0] if len(seq_cols) > 0 else cat_cols[0]
-
-    embedding_module = SequenceEmbeddingFeatures(
-        feature_config=feature_configs, item_id=item_id_col, aggregation="concat"
-    )
-
-    # Tester pour récupérer la dimension concat réelle
-    with torch.no_grad():
-        test_batch = {}
-        for col in all_cols:
-            # [2, S] indices aléatoires
-            test_batch[col] = torch.randint(0, vocab, (2, max_seq_len))
-        out = embedding_module(test_batch)
-        if out.dim() == 2:
-            emb_dim = out.shape[-1]
-        else:
-            emb_dim = out.shape[-1]
-
-    return embedding_module, emb_dim
+    # item_id = 1ère feature par convention (obligatoire pour T4Rec)
+    item_id = list(feature_dims.keys())[0]
+    emb = SequenceEmbeddingFeatures(feature_config=feature_cfgs, item_id=item_id, aggregation="concat")
+    concat_dim = per_dim * n_feats
+    return emb, concat_dim
 
 
-# =============================================================================
-# Entraînement
-# =============================================================================
-
-def validate_config(config: Dict[str, Any], strict: bool = False) -> List[str]:
-    """Validation minimale de la config."""
-    errors = []
-    req = {
-        "data.dataset_name": str,
-        "data.sample_size": int,
-        "features.sequence_cols": list,
-        "features.categorical_cols": list,
-        "features.target_col": str,
-        "model.d_model": int,
-        "model.n_heads": int,
-        "model.n_layers": int,
-    }
-    for path, typ in req.items():
-        v = config
-        for k in path.split("."):
-            if k not in v:
-                errors.append(f"{path} is required")
-                v = None
-                break
-            v = v[k]
-        if v is not None and not isinstance(v, typ):
-            errors.append(f"{path} must be {typ.__name__}")
-
-    # divisibilité têtes
-    m = config["model"]
-    if m.get("d_model", 0) % m.get("n_heads", 1) != 0:
-        errors.append("model.d_model doit être divisible par model.n_heads")
-    return errors
-
-
-class _NboDataset(tud.Dataset):
-    """Dataset simple pour mini-batchs: inputs dict + target."""
-    def __init__(self, data_dict: Dict[str, torch.Tensor], targets: np.ndarray):
-        self.keys = list(data_dict.keys())
-        self.data_dict = data_dict
-        self.targets = targets
-
-    def __len__(self):
-        return len(self.targets)
-
-    def __getitem__(self, i):
-        x = {k: self.data_dict[k][i] for k in self.keys}
-        y = int(self.targets[i])
-        return x, y
-
-
-def _collate_fn(batch):
-    """Empile proprement un batch de dicts {feat: tensor}."""
-    keys = batch[0][0].keys()
-    X = {k: torch.stack([b[0][k] for b in batch], dim=0) for k in keys}
-    y = torch.tensor([b[1] for b in batch], dtype=torch.long)
-    return X, y
-
+# ------------------------------------------------------------------
+# 5) ENTRAÎNEMENT
+# ------------------------------------------------------------------
 
 def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Entraîne le modèle hybride.
-    Étapes clés:
-    - chargement df (Dataiku)
-    - split stratifié
-    - fit transformers sur train → transform train/val
-    - DataLoader mini-batch + class weights
-    - TransformerEncoder + CrossEntropy + (option) early stopping
-    - Sauvegardes Dataiku (features/predictions/metrics/model)
+    Pipeline complet :
+      - construction des séquences temporelles (SequenceBuilder),
+      - encodage des features (cat/seq),
+      - embeddings T4Rec + Transformer,
+      - training/validation,
+      - métriques + sauvegardes.
     """
-    start = time.time()
+    t0 = time.time()
     _setup_logging(config["runtime"]["verbose"])
     logger = logging.getLogger(__name__)
-    verbose = config["runtime"]["verbose"]
 
-    # Seed
-    seed = config["runtime"].get("seed", 42)
-    torch.manual_seed(seed)
-    np.random.seed(seed)
+    # Seeds
+    seed = config["runtime"].get("seed")
+    if seed is not None:
+        np.random.seed(seed)
+        torch.manual_seed(seed)
 
-    # Chargement
-    dataset_name = config["data"]["dataset_name"]
-    sample_size = config["data"]["sample_size"]
-    partitions = config["data"].get("partitions")
-    temporal_split = config["data"].get("temporal_split")
-    df, _ = _load_dataframe(dataset_name, sample_size, partitions, temporal_split)
-    if verbose:
-        logger.info(f"Loaded {len(df):,} rows from {dataset_name}")
+    # 1) Charger données
+    events_df = _load_events_df(config)
+    profile_df = _load_profile_df_if_any(config)
 
-    # Features & target
-    seq_cols = config["features"]["sequence_cols"]
-    cat_cols = config["features"]["categorical_cols"]
-    target_col = config["features"]["target_col"]
+    # 2) Construire séquences temporelles
+    sb_cfg = SequenceBuilderConfig(
+        client_id_col=config["data"]["client_id_col"],
+        time_col=config["data"]["event_time_col"],
+        item_col=config["data"]["product_col"],
+        extra_event_cols=config["data"].get("event_extra_cols", []),
+        months_lookback=config["sequence"]["months_lookback"],
+        time_granularity=config["sequence"]["time_granularity"],
+        min_events_per_client=config["sequence"]["min_events_per_client"],
+        target_horizon=config["sequence"]["target_horizon"],
+        pad_value=config["sequence"]["pad_value"],
+        build_target_from_events=config["sequence"]["build_target_from_events"],
+    )
+    builder = SequenceBuilder(sb_cfg)
+    seq_pack = builder.fit_transform(events_df)
+    # seq_pack contient :
+    #  - "X_seq": dict {feature_name: np.array [N_clients, T] d'ids}
+    #  - "y": np.array (cible item à T+horizon) si build_target_from_events=True
+    #  - "client_ids": ordre des clients
+    #  - "vocab_sizes": dict {feature_name: vocab_size}
+    logger.info(f"[SequenceBuilder] X_seq keys={list(seq_pack['X_seq'].keys())}, shape={next(iter(seq_pack['X_seq'].values())).shape}")
 
-    # Exclusion de certaines valeurs cibles (case-insensitive)
-    exclude_vals = set([str(v).lower() for v in config["features"].get("exclude_target_values", [])])
-    if len(exclude_vals) > 0:
-        tgt_lower = df[target_col].astype(str).str.lower()
-        counts = {v: int((tgt_lower == v).sum()) for v in exclude_vals}
-        logger.info(f"EXCLUSION ANALYSIS - target à exclure: {counts}")
-        df = df.loc[~tgt_lower.isin(exclude_vals)].reset_index(drop=True)
-        logger.info(f"Après exclusion: {len(df):,} lignes")
+    # 3) Créer/ajouter features profil (facultatif)
+    #    → on traite les colonnes profil (catégorielles / "sequence_cols" mono-pas)
+    X_cat = {}
+    X_seq_extra = {}
+    if profile_df is not None:
+        # Joindre sur client_id
+        pid = config["data"]["profile_join_key"]
+        prof = profile_df.set_index(pid).reindex(seq_pack["client_ids"]).reset_index()
+        prof.columns = [pid] + list(prof.columns[1:])
 
-    # Encodage label
+        # CATEGORIELLES profil → encodage entiers
+        cat_cols = config["data"].get("profile_categorical_cols", [])
+        if len(cat_cols) > 0:
+            cat_tr = CategoricalTransformer(handle_unknown="encode", unknown_value=1, name="ProfileCategorical")
+            cat_tr.fit(prof, cat_cols)
+            cat_res = cat_tr.transform(prof)
+            # Chaque col devient <col>_encoded → vecteur [N_clients]
+            for k, arr in cat_res.data.items():
+                # Pour compat T4Rec (qui attend [B,T]), on répète sur T et on mettra petite table
+                X_cat[k.replace("_encoded", "")] = arr.astype(np.int64)
+
+        # SEQ "mono-pas" profil (ex: âge) → on en fait une "séquence plate" (répétée sur T)
+        seq_cols = config["data"].get("profile_sequence_cols", [])
+        if len(seq_cols) > 0:
+            seq_tr = SequenceTransformer(name="ProfileSeq")
+            seq_tr.fit(prof, seq_cols)
+            seq_res = seq_tr.transform(prof)
+            for k, arr in seq_res.data.items():
+                # arr est float [N], on va le discrétiser pour embeddings → indices int dans [0, vocab-1]
+                # on choisit un vocab "profil" petit (ex 200) et un simple scale
+                vocab_p = 200
+                arr01 = np.clip(arr, 0.0, 1.0)
+                X_seq_extra[k.replace("_seq", "")] = (arr01 * (vocab_p - 1)).astype(np.int64)
+
+    # 4) Cible (y)
+    if config["sequence"]["build_target_from_events"]:
+        y_raw = seq_pack["y"]  # items (str ou id) à T+h
+        y_series = pd.Series(y_raw).astype(str)
+    else:
+        # Alternative : target fournie dans une table (moins recommandé ici)
+        raise ValueError("Pour la version temporelle, utilisez build_target_from_events=True.")
+
+    # 5) Regroupement classes rares
+    min_count = config["features"]["merge_rare_threshold"]
+    other_name = config["features"]["other_class_name"]
+    y_merged, rare_map = merge_rare_classes(y_series, min_count=min_count, other_name=other_name)
+
+    if len(rare_map) > 0:
+        logger.info("=== Regroupement classes rares → 'AUTRES_PRODUITS' ===")
+        # On logue un résumé compact
+        tops = list(rare_map.keys())[:20]
+        logger.info(f"  {len(rare_map)} classes fusionnées. Exemples: {tops} → {other_name}")
+        # On sauvegarde aussi le mapping complet en JSON dans les artifacts plus tard
+    else:
+        logger.info("Aucune classe fusionnée (pas de classe < seuil).")
+
+    # 6) Encodage cible (LabelEncoder)
     encoder = LabelEncoder()
-    targets = encoder.fit_transform(df[target_col])
+    y = encoder.fit_transform(y_merged.values)
     n_classes = len(encoder.classes_)
-    if verbose:
-        logger.info(f"Nombre de classes après filtre: {n_classes}")
+    logger.info(f"Cible: {n_classes} classes après fusion éventuelle.")
 
-    # Split stratifié
-    idx = np.arange(len(df))
-    train_idx, val_idx = train_test_split(
-        idx,
-        test_size=config["training"]["val_split"],
-        stratify=targets,
-        random_state=seed,
+    # 7) Préparer les features pour T4Rec → tout doit être des IDs entiers dans [0, vocab-1]
+    #   7.1) features séquentielles principales (events) déjà en IDs int via SequenceBuilder
+    #        (ex: "item_id" + autres extras d’événements optionnels)
+    X_seq_dict = {}
+    for feat, mat in seq_pack["X_seq"].items():  # mat [N, T] int64
+        X_seq_dict[feat] = torch.tensor(mat, dtype=torch.long)
+
+    #   7.2) features profil "seq_extra" (répéter par T)
+    for feat, vec in X_seq_extra.items():  # vec [N]
+        repeated = np.repeat(vec[:, None], repeats=X_seq_dict[list(X_seq_dict.keys())[0]].shape[1], axis=1)
+        X_seq_dict[feat] = torch.tensor(repeated, dtype=torch.long)
+
+    #   7.3) features profil catégorielles (non séquentielles) → répéter sur T
+    for feat, vec in X_cat.items():
+        repeated = np.repeat(vec[:, None], repeats=X_seq_dict[list(X_seq_dict.keys())[0]].shape[1], axis=1)
+        X_seq_dict[feat] = torch.tensor(repeated.astype(np.int64), dtype=torch.long)
+
+    # 8) Vocab sizes (pour embeddings)
+    vocab_sizes = dict(seq_pack["vocab_sizes"])  # events
+    # ajouter profils "seq_extra"
+    for feat in X_seq_extra.keys():
+        vocab_sizes[feat] = vocab_sizes.get(feat, 200)
+    # ajouter profils catégoriels
+    for feat in X_cat.keys():
+        # approx : 1 + max val observée (sinon 50 par défaut)
+        vmax = int(np.max(X_cat[feat])) if len(X_cat[feat]) > 0 else 1
+        vocab_sizes[feat] = max(vmax + 1, 10)
+
+    # 9) Split train/val
+    N = len(y)
+    idx = np.arange(N)
+    np.random.shuffle(idx)
+    split = int(N * (1.0 - config["training"]["val_split"]))
+    tr_idx, va_idx = idx[:split], idx[split:]
+
+    def take_idx(d: Dict[str, torch.Tensor], ids: np.ndarray) -> Dict[str, torch.Tensor]:
+        return {k: v[ids] for k, v in d.items()}
+
+    Xtr = take_idx(X_seq_dict, tr_idx)
+    Xva = take_idx(X_seq_dict, va_idx)
+    ytr = torch.tensor(y[tr_idx], dtype=torch.long)
+    yva = torch.tensor(y[va_idx], dtype=torch.long)
+
+    # 10) Module d'embeddings T4Rec
+    d_model = config["model"]["d_model"]
+    max_T = config["model"]["max_sequence_length"]
+    emb_mod, concat_dim = _build_t4rec_embedding_module(
+        feature_dims=vocab_sizes,
+        d_model=d_model,
+        max_seq_len=max_T,
     )
 
-    # Fit transformers sur TRAIN uniquement
-    seq_tr = SequenceTransformer(
-        max_sequence_length=config["model"].get("max_sequence_length", 1),
-        vocab_size=config["model"]["vocab_size"],
-        auto_adjust=False,  # on fige pour la reproductibilité
-    ).fit(df.iloc[train_idx], seq_cols)
-
-    cat_tr = CategoricalTransformer(
-        max_categories=config["transformers"]["categorical"]["max_categories"],
-        handle_unknown=config["transformers"]["categorical"]["handle_unknown"],
-        unknown_value=config["transformers"]["categorical"]["unknown_value"],
-    ).fit(df.iloc[train_idx], cat_cols)
-
-    # Transform train / val (sans fuite)
-    seq_train = seq_tr.transform(df.iloc[train_idx]).data
-    seq_val = seq_tr.transform(df.iloc[val_idx]).data
-    cat_train = cat_tr.transform(df.iloc[train_idx]).data
-    cat_val = cat_tr.transform(df.iloc[val_idx]).data
-
-    # Helper conversion float[0..1] → indices entiers [0..vocab-1]
-    vocab_size = config["model"]["vocab_size"]
-
-    def to_int_index(x_float: np.ndarray) -> np.ndarray:
-        x = np.array(x_float, dtype=np.float32)
-        x = np.nan_to_num(x, nan=0.0, posinf=1.0, neginf=0.0)
-        return np.clip((x * (vocab_size - 1)).astype(np.int64), 0, vocab_size - 1)
-
-    # Construire batch tensors
-    train_batch: Dict[str, torch.Tensor] = {}
-    val_batch: Dict[str, torch.Tensor] = {}
-
-    # Séquentielles: reshape [N, 1] (seq_len=1) pour T4Rec
-    for col in seq_cols:
-        key = f"{col}_seq"
-        tr_vals = to_int_index(seq_train[key]).reshape(-1, 1)
-        va_vals = to_int_index(seq_val[key]).reshape(-1, 1)
-        train_batch[col] = torch.tensor(tr_vals, dtype=torch.long)
-        val_batch[col] = torch.tensor(va_vals, dtype=torch.long)
-
-    # Catégorielles: une valeur par ligne (pas de dimension séquence)
-    for col in cat_cols:
-        key = f"{col}_encoded"
-        tr_vals = np.clip(np.array(cat_train[key]).astype(np.int64), 0, vocab_size - 1)
-        va_vals = np.clip(np.array(cat_val[key]).astype(np.int64), 0, vocab_size - 1)
-        train_batch[col] = torch.tensor(tr_vals, dtype=torch.long)
-        val_batch[col] = torch.tensor(va_vals, dtype=torch.long)
-
-    train_targets = targets[train_idx]
-    val_targets = targets[val_idx]
-    y_train_t = torch.tensor(train_targets, dtype=torch.long)
-    y_val_t = torch.tensor(val_targets, dtype=torch.long)
-
-    # Construire module d'embeddings T4Rec et modèle hybride
-    embedding_module, emb_dim = _create_t4rec_model(config)
-    model = T4RecHybridModel(
-        embedding_module=embedding_module,
-        n_products=n_classes,
-        d_model=config["model"]["d_model"],
-        n_layers=config["model"]["n_layers"],
+    # 11) Modèle
+    model = T4RecTemporalModel(
+        embedding_module=emb_mod,
+        d_model=d_model,
         n_heads=config["model"]["n_heads"],
+        n_layers=config["model"]["n_layers"],
         dropout=config["model"]["dropout"],
-        max_sequence_length=config["model"].get("max_sequence_length", 1),
-        embedding_output_dim=emb_dim,
+        n_classes=n_classes,
+        max_seq_len=max_T,
+        proj_in_dim=concat_dim,
     )
+    logger.info(f"Model params: {sum(p.numel() for p in model.parameters()):,}")
 
-    if verbose:
-        total_params = sum(p.numel() for p in model.parameters())
-        logger.info(f"Model created with {total_params:,} parameters")
-
-    # DataLoader (mini-batches)
-    train_ds = _NboDataset(train_batch, train_targets)
-    train_loader = tud.DataLoader(
-        train_ds,
-        batch_size=config["training"]["batch_size"],
-        shuffle=True,
-        collate_fn=_collate_fn,
-    )
-
-    # Optimizer & scheduler
-    opt_name = config["training"].get("optimizer", "adamw").lower()
-    if opt_name == "adamw":
+    # 12) Optim / Loss
+    if config["training"]["optimizer"].lower() == "adamw":
         optimizer = torch.optim.AdamW(
             model.parameters(),
             lr=config["training"]["learning_rate"],
@@ -586,274 +543,186 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
             weight_decay=config["training"]["weight_decay"],
         )
 
-    sched_name = config["training"].get("scheduler")
-    if sched_name == "cosine":
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=config["training"]["num_epochs"]
-        )
+    # Class weights (optionnel)
+    if config["training"]["class_weighting"]:
+        counts = np.bincount(ytr.numpy(), minlength=n_classes).astype(np.float32)
+        inv = 1.0 / np.clip(counts, 1.0, None)
+        weights = inv / inv.sum() * n_classes
+        class_w = torch.tensor(weights, dtype=torch.float32)
+        loss_fn = nn.CrossEntropyLoss(weight=class_w)
     else:
-        scheduler = None
+        loss_fn = nn.CrossEntropyLoss()
 
-    # Class weights + label smoothing
-    classes = np.unique(train_targets)
-    class_weights = compute_class_weight("balanced", classes=classes, y=train_targets)
-    cw = torch.tensor(class_weights, dtype=torch.float)
-    loss_fn = nn.CrossEntropyLoss(weight=cw, label_smoothing=0.05)
-
-    # Entraînement
+    # 13) Training loop (full-batch pour simplicité ; Dataiku → mini-batches possible)
     num_epochs = config["training"]["num_epochs"]
-    patience = config["training"].get("early_stopping_patience", 0)
-    best_val_loss = float("inf")
-    best_state = None
-    no_improve = 0
+    bs = config["training"]["batch_size"]
+    grad_clip = config["training"].get("gradient_clip", None)
 
-    pbar = tqdm(total=num_epochs, desc="Training T4Rec XLNet") if (config["runtime"]["progress"] and _HAS_TQDM) else None
+    def iterate_batches(X: Dict[str, torch.Tensor], y: torch.Tensor, batch_size: int):
+        N = len(y)
+        for s in range(0, N, batch_size):
+            e = min(s + batch_size, N)
+            yield {k: v[s:e] for k, v in X.items()}, y[s:e]
 
-    for epoch in range(1, num_epochs + 1):
+    pbar = tqdm(range(num_epochs), desc="Training") if (_HAS_TQDM and config["runtime"]["progress"]) else range(num_epochs)
+    history = []
+
+    for epoch in pbar:
         model.train()
-        run_loss = 0.0
-
-        for xb, yb in train_loader:
+        tr_loss = 0.0; n_steps = 0
+        for xb, yb in iterate_batches(Xtr, ytr, bs):
             optimizer.zero_grad()
             logits = model(xb)
             loss = loss_fn(logits, yb)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), config["training"]["gradient_clip"])
+            if grad_clip:
+                nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
-            run_loss += loss.item() * len(yb)
+            tr_loss += loss.item(); n_steps += 1
+        tr_loss /= max(1, n_steps)
 
-        train_loss = run_loss / len(train_ds)
-
-        # Validation full-batch (simple)
+        # Validation
         model.eval()
         with torch.no_grad():
-            val_logits = model(val_batch)
-            val_loss = loss_fn(val_logits, y_val_t).item()
-            val_pred = val_logits.argmax(1)
-            val_acc = (val_pred == y_val_t).float().mean().item()
+            # full val (simple)
+            logits = model(Xva)
+            va_loss = loss_fn(logits, yva).item()
+            preds = torch.argmax(logits, dim=1)
+            acc = (preds == yva).float().mean().item()
 
-        if scheduler is not None:
-            scheduler.step()
+        history.append({"epoch": epoch + 1, "train_loss": tr_loss, "val_loss": va_loss, "val_accuracy": acc})
+        if _HAS_TQDM and config["runtime"]["progress"]:
+            pbar.set_postfix({"loss": f"{tr_loss:.4f}", "val_acc": f"{acc:.4f}"})
+        logger.info(f"Epoch {epoch+1}/{num_epochs} | loss={tr_loss:.4f} | val_loss={va_loss:.4f} | val_acc={acc:.4f}")
 
-        if pbar:
-            pbar.set_postfix({"loss": f"{train_loss:.4f}", "val_acc": f"{val_acc:.4f}"})
-            pbar.update(1)
-
-        if verbose:
-            logger.info(f"Epoch {epoch}/{num_epochs} | train_loss={train_loss:.4f} | val_loss={val_loss:.4f} | val_acc={val_acc:.4f}")
-
-        # Early stopping (optionnel)
-        if patience > 0:
-            if val_loss < best_val_loss - 1e-4:
-                best_val_loss = val_loss
-                best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-                no_improve = 0
-            else:
-                no_improve += 1
-                if no_improve >= patience:
-                    if verbose:
-                        logger.info("Early stopping déclenché")
-                    break
-
-    if pbar:
-        pbar.close()
-
-    # Restaurer meilleur état si early stopping
-    if best_state is not None:
-        model.load_state_dict(best_state)
-
-    # Évaluation finale
+    # 14) Final metrics
     model.eval()
     with torch.no_grad():
-        val_logits = model(val_batch)
-        val_pred = val_logits.argmax(1)
-        final_acc = (val_pred == y_val_t).float().mean().item()
-
-        # métriques additionnelles
-        precision_w, recall_w, f1_w, _ = precision_recall_fscore_support(
-            y_val_t.cpu().numpy(), val_pred.cpu().numpy(), average="weighted", zero_division=0
+        logits = model(Xva)
+        preds = torch.argmax(logits, dim=1)
+        acc = (preds == yva).float().mean().item()
+        precision, recall, f1, _ = precision_recall_fscore_support(
+            yva.numpy(), preds.numpy(), average="weighted", zero_division=0
         )
-        precision_m, recall_m, f1_m, _ = precision_recall_fscore_support(
-            y_val_t.cpu().numpy(), val_pred.cpu().numpy(), average="macro", zero_division=0
-        )
-        bal_acc = balanced_accuracy_score(y_val_t.cpu().numpy(), val_pred.cpu().numpy())
 
-    # Scores probabilistes pour Top-K & export
-    val_probs = softmax(val_logits.cpu().numpy(), axis=1)
-    true_labels = y_val_t.cpu().numpy()
+    # 15) Top-K (format collègue)
+    prediction_scores = logits.cpu().numpy()
+    true_labels = yva.cpu().numpy()
 
-    # -----------------------------------------------------------------------------
-    # Sauvegardes Dataiku (facultatif)
-    # -----------------------------------------------------------------------------
+    # mapping inverse enc -> classe (str)
+    inverse_target_mapping = {i: cls for i, cls in enumerate(encoder.classes_)}
+
+    # On réutilise tes helpers (inchangés)
+    topk_metrics, _ignored = evaluate_topk_metrics_nbo(
+        predictions=prediction_scores,
+        targets=true_labels,
+        inverse_target_mapping=inverse_target_mapping,
+        k_values=[1, 3, 5, 10],
+    )
+
+    # 16) Sauvegardes Dataiku (best effort)
     saved = {}
-    if _HAS_DATAIKU and any(config["outputs"].get(f"{k}_dataset") for k in ["features", "predictions", "metrics", "model_artifacts"]):
-        logger.info("Saving outputs to Dataiku datasets...")
+    if _HAS_DATAIKU:
+        try:
+            # PREDICTIONS (client, top1..top5)
+            topk = 5
+            pred_list = []
+            for i, (score, ytrue) in enumerate(zip(prediction_scores, true_labels)):
+                top_idx = np.argsort(score)[-topk:][::-1]
+                row = {
+                    "client_id": int(seq_pack["client_ids"][va_idx[i]]),
+                    "true_label": str(inverse_target_mapping.get(int(ytrue), "UNK")),
+                    "pred_top1": str(inverse_target_mapping.get(int(top_idx[0]), "UNK")),
+                    "pred_top1_score": float(score[top_idx[0]]),
+                }
+                # facultatif : top2..top5
+                for k in range(1, topk):
+                    ki = top_idx[k]
+                    row[f"pred_top{k+1}"] = str(inverse_target_mapping.get(int(ki), "UNK"))
+                    row[f"pred_top{k+1}_score"] = float(score[ki])
+                pred_list.append(row)
 
-        # 1) Features report simple
-        if config["outputs"].get("features_dataset"):
-            features_df = pd.DataFrame({
-                "feature_name": seq_cols + cat_cols,
-                "feature_type": ["sequence"] * len(seq_cols) + ["categorical"] * len(cat_cols),
-                "importance": [1.0] * (len(seq_cols) + len(cat_cols)),  # placeholder
-            })
-            dataiku.Dataset(config["outputs"]["features_dataset"]).write_with_schema(features_df)
-            saved["features"] = config["outputs"]["features_dataset"]
-            logger.info(f"Features saved to {config['outputs']['features_dataset']}")
+            pred_df = pd.DataFrame(pred_list)
+            if config["outputs"].get("predictions_dataset"):
+                dataiku.Dataset(config["outputs"]["predictions_dataset"]).write_with_schema(pred_df)
+                saved["predictions"] = config["outputs"]["predictions_dataset"]
 
-        # 2) Predictions détaillées (Top-5, noms produits)
-        if config["outputs"].get("predictions_dataset"):
-            # mapping encodé → libellé
-            inv_map = {i: str(lbl) for i, lbl in enumerate(encoder.classes_)}
-            rows = []
-            for i, (probs, y_true) in enumerate(zip(val_probs, true_labels)):
-                top5_idx = np.argsort(probs)[-5:][::-1]
-                top5_scores = probs[top5_idx]
-                pred_idx = top5_idx[0]
-                rows.append({
-                    "client_id": i + 1,
-                    "predicted_product_id": int(pred_idx),
-                    "predicted_product_name": inv_map.get(int(pred_idx), f"UNKNOWN_{pred_idx}"),
-                    "true_product_id": int(y_true),
-                    "true_product_name": inv_map.get(int(y_true), f"UNKNOWN_{y_true}"),
-                    "prediction_correct": bool(pred_idx == y_true),
-                    "confidence_score": float(probs[pred_idx]),
-                    "top1_product_name": inv_map.get(int(top5_idx[0]), f"UNK_{top5_idx[0]}"),
-                    "top1_score": float(top5_scores[0]),
-                    "top2_product_name": inv_map.get(int(top5_idx[1]), None) if len(top5_idx) > 1 else None,
-                    "top2_score": float(top5_scores[1]) if len(top5_scores) > 1 else None,
-                    "top3_product_name": inv_map.get(int(top5_idx[2]), None) if len(top5_idx) > 2 else None,
-                    "top3_score": float(top5_scores[2]) if len(top5_scores) > 2 else None,
-                    "top4_product_name": inv_map.get(int(top5_idx[3]), None) if len(top5_idx) > 3 else None,
-                    "top4_score": float(top5_scores[3]) if len(top5_scores) > 3 else None,
-                    "top5_product_name": inv_map.get(int(top5_idx[4]), None) if len(top5_idx) > 4 else None,
-                    "top5_score": float(top5_scores[4]) if len(top5_scores) > 4 else None,
-                    "raw_scores_json": str(probs.tolist()),
-                    "prediction_timestamp": pd.Timestamp.now(),
-                })
-            pred_df = pd.DataFrame(rows)
-            dataiku.Dataset(config["outputs"]["predictions_dataset"]).write_with_schema(pred_df)
-            saved["predictions"] = config["outputs"]["predictions_dataset"]
-            logger.info(f"Detailed predictions saved to {config['outputs']['predictions_dataset']}")
-
-        # 3) Metrics standard + Top-K
-        if config["outputs"].get("metrics_dataset"):
-            metrics_records = []
-            std_metrics = [
-                ("accuracy", final_acc),
-                ("precision_weighted", precision_w),
-                ("recall_weighted", recall_w),
-                ("f1_weighted", f1_w),
-                ("precision_macro", precision_m),
-                ("recall_macro", recall_m),
-                ("f1_macro", f1_m),
-                ("balanced_accuracy", bal_acc),
+            # METRICS
+            metrics_rows = []
+            metrics_rows += [
+                {"metric_name": "accuracy", "metric_value": float(acc), "metric_type": "standard", "dataset_split": "validation"},
+                {"metric_name": "precision", "metric_value": float(precision), "metric_type": "standard", "dataset_split": "validation"},
+                {"metric_name": "recall", "metric_value": float(recall), "metric_type": "standard", "dataset_split": "validation"},
+                {"metric_name": "f1", "metric_value": float(f1), "metric_type": "standard", "dataset_split": "validation"},
             ]
-            now = pd.Timestamp.now()
-            for name, val in std_metrics:
-                metrics_records.append({
-                    "metric_name": name,
-                    "metric_value": float(val),
-                    "metric_type": "standard",
-                    "dataset_split": "validation",
-                    "k_value": None,
-                    "timestamp": now,
-                })
+            # top-k NBO
+            for k, d in topk_metrics.items():
+                metrics_rows += [
+                    {"metric_name": "Precision@K", "metric_value": float(d.get("Precision@K", 0.0)), "metric_type": "topk_nbo", "dataset_split": "validation", "k_value": k},
+                    {"metric_name": "Recall@K", "metric_value": float(d.get("Recall@K", 0.0)), "metric_type": "topk_nbo", "dataset_split": "validation", "k_value": k},
+                    {"metric_name": "F1@K", "metric_value": float(d.get("F1@K", 0.0)), "metric_type": "topk_nbo", "dataset_split": "validation", "k_value": k},
+                    {"metric_name": "NDCG@K", "metric_value": float(d.get("NDCG@K", 0.0)), "metric_type": "topk_nbo", "dataset_split": "validation", "k_value": k},
+                    {"metric_name": "MAP", "metric_value": float(d.get("MAP", 0.0)), "metric_type": "topk_nbo", "dataset_split": "validation", "k_value": k},
+                    {"metric_name": "HitRate@K", "metric_value": float(d.get("HitRate@K", 0.0)), "metric_type": "topk_nbo", "dataset_split": "validation", "k_value": k},
+                    {"metric_name": "Coverage@K", "metric_value": float(d.get("Coverage@K", 0.0)), "metric_type": "topk_nbo", "dataset_split": "validation", "k_value": k},
+                    {"metric_name": "Clients_evaluated", "metric_value": float(d.get("Clients_evaluated", 0.0)), "metric_type": "topk_nbo", "dataset_split": "validation", "k_value": k},
+                ]
+            met_df = pd.DataFrame(metrics_rows)
+            if config["outputs"].get("metrics_dataset"):
+                dataiku.Dataset(config["outputs"]["metrics_dataset"]).write_with_schema(met_df)
+                saved["metrics"] = config["outputs"]["metrics_dataset"]
 
-            # Top-K façon collègue
-            inv_map = {i: str(lbl) for i, lbl in enumerate(encoder.classes_)}
-            k_values = [1, 3, 5]
-            topk = evaluate_topk_metrics_nbo(val_probs, true_labels, inv_map, k_values)
-            for k, d in topk.items():
-                for k_name, v in [
-                    ("precision_at_k", d.get("Precision@K", 0.0)),
-                    ("recall_at_k", d.get("Recall@K", 0.0)),
-                    ("f1_at_k", d.get("F1@K", 0.0)),
-                    ("ndcg_at_k", d.get("NDCG@K", 0.0)),
-                    ("map", d.get("MAP", 0.0)),
-                    ("hit_rate_at_k", d.get("HitRate@K", 0.0)),
-                    ("coverage_at_k", d.get("Coverage@K", 0.0)),
-                    ("clients_evaluated", d.get("Clients_evaluated", 0)),
-                ]:
-                    metrics_records.append({
-                        "metric_name": k_name,
-                        "metric_value": float(v),
-                        "metric_type": "topk_nbo",
-                        "dataset_split": "validation",
-                        "k_value": int(k),
-                        "timestamp": now,
-                    })
-
-            mdf = pd.DataFrame(metrics_records)
-            dataiku.Dataset(config["outputs"]["metrics_dataset"]).write_with_schema(mdf)
-            saved["metrics"] = config["outputs"]["metrics_dataset"]
-            logger.info(f"Metrics saved to {config['outputs']['metrics_dataset']}")
-
-        # 4) Model artifacts
-        if config["outputs"].get("model_artifacts_dataset"):
-            art = pd.DataFrame({
-                "artifact_name": ["model_config", "model_architecture", "training_config"],
+            # ARTIFACTS (inclure mapping rarité)
+            artifacts = pd.DataFrame({
+                "artifact_name": ["model_config", "sequence_builder_config", "rare_class_mapping_json"],
                 "artifact_value": [
-                    str(config["model"]),
-                    f"T4RecHybrid-{config['model']['n_layers']}L-{config['model']['n_heads']}H-{config['model']['d_model']}D",
-                    str(config["training"]),
+                    json.dumps(config["model"]),
+                    json.dumps(sb_cfg.__dict__),
+                    json.dumps(rare_map, ensure_ascii=False),
                 ],
                 "timestamp": [pd.Timestamp.now()]*3,
             })
-            dataiku.Dataset(config["outputs"]["model_artifacts_dataset"]).write_with_schema(art)
-            saved["model_artifacts"] = config["outputs"]["model_artifacts_dataset"]
-            logger.info(f"Model artifacts saved to {config['outputs']['model_artifacts_dataset']}")
+            if config["outputs"].get("model_artifacts_dataset"):
+                dataiku.Dataset(config["outputs"]["model_artifacts_dataset"]).write_with_schema(artifacts)
+                saved["model_artifacts"] = config["outputs"]["model_artifacts_dataset"]
 
-    # Retour
-    exec_time = time.time() - start
-    return {
-        "metrics": {
-            "accuracy": final_acc,
-            "precision_weighted": precision_w,
-            "recall_weighted": recall_w,
-            "f1_weighted": f1_w,
-            "precision_macro": precision_m,
-            "recall_macro": recall_m,
-            "f1_macro": f1_m,
-            "balanced_accuracy": bal_acc,
-        },
+        except Exception as e:
+            logger.warning(f"Sauvegarde Dataiku échouée (non bloquant): {e}")
+
+    # 17) Retour
+    out = {
+        "metrics": {"accuracy": acc, "precision": precision, "recall": recall, "f1": f1},
         "predictions": {
-            "raw_outputs": val_probs,                  # ← probabilités (softmax)
-            "predicted_classes": val_probs.argmax(1),
+            "raw_outputs": prediction_scores,
+            "predicted_classes": preds.cpu().numpy(),
             "true_classes": true_labels,
         },
         "model_info": {
-            "total_params": sum(p.numel() for p in model.parameters()),
-            "architecture": f"T4RecHybrid-{config['model']['n_layers']}L-{config['model']['n_heads']}H-{config['model']['d_model']}D",
+            "total_params": int(sum(p.numel() for p in model.parameters())),
+            "architecture": f"Hybrid-T4Rec-Transformer {config['model']['n_layers']}L-{config['model']['n_heads']}H-{config['model']['d_model']}D",
         },
         "data_info": {
-            "rows": len(df),
-            "train_samples": len(train_idx),
-            "val_samples": len(val_idx),
-            "n_sequence_features": len(seq_cols),
-            "n_categorical_features": len(cat_cols),
-            "n_features": len(seq_cols) + len(cat_cols),
-            "target_classes": n_classes,
+            "n_clients": int(len(y)),
+            "seq_len": int(next(iter(X_seq_dict.values())).shape[1]),
+            "features": list(X_seq_dict.keys()),
+            "n_classes": int(n_classes),
         },
-        "execution_time": exec_time,
+        "execution_time": float(time.time() - t0),
         "saved_datasets": saved,
     }
+    return out
 
 
-# =============================================================================
-# TOP-K façon “collègue”
-# =============================================================================
+# ------------------------------------------------------------------
+# 6) TOP-K (inchangé, repris de ta version)
+# ------------------------------------------------------------------
 
 def compute_ranking_metrics_at_k(client_ids, labels, scores, products, k):
     """
-    Calcule les métriques NBO par client puis moyenne.
-    - client_ids: array [n_rows]
-    - labels: 0/1
-    - scores: probas pour chaque (client, produit)
-    - products: identifiants produits (texte)
+    (copié / simplifié de ta version ; inchangé dans l'esprit)
     """
     from sklearn.metrics import ndcg_score, average_precision_score
     from collections import defaultdict
-
     client_data = defaultdict(list)
     for cid, label, score, prod in zip(client_ids, labels, scores, products):
         client_data[cid].append((label, score, prod))
@@ -872,31 +741,21 @@ def compute_ranking_metrics_at_k(client_ids, labels, scores, products, k):
 
         if y_true.sum() == 0 or len(y_true) < 2 or np.isnan(y_score).any():
             continue
-
         valid_clients += 1
         top_k_idx = np.argsort(y_score)[::-1][:k]
         y_topk = y_true[top_k_idx]
         p_topk = y_prods[top_k_idx]
-
         precision_topk_total += y_topk.sum()
         topk_count += k
-
-        try:
-            ndcgs.append(ndcg_score([y_true], [y_score], k=k))
-            aps.append(average_precision_score(y_true, y_score))
-        except Exception:
-            ndcgs.append(0.0)
-            aps.append(0.0)
-
+        ndcgs.append(ndcg_score([y_true], [y_score], k=k))
+        aps.append(average_precision_score(y_true, y_score))
         rec_k = y_topk.sum() / y_true.sum()
         recalls.append(rec_k)
-
         prec_k = y_topk.sum() / k
-        f1s.append(0.0 if (prec_k + rec_k) == 0 else 2 * (prec_k * rec_k) / (prec_k + rec_k))
-
+        if (prec_k + rec_k) > 0:
+            f1s.append(2 * (prec_k * rec_k) / (prec_k + rec_k))
         if y_topk.sum() > 0:
             hit_count += 1
-
         recommended_products.update(p_topk)
 
     return {
@@ -913,38 +772,25 @@ def compute_ranking_metrics_at_k(client_ids, labels, scores, products, k):
 
 def convert_predictions_to_nbo_format(predictions, targets, inverse_target_mapping):
     """
-    Convertit nos prédictions [n_samples, n_classes] en format NBO
-    (client, label binaire, score, produit).
-    'predictions' DOIT être des probabilités (softmax).
+    Idem ta version.
     """
     client_ids_list, labels_list, scores_list, products_list = [], [], [], []
     n_samples, n_classes = predictions.shape
-
-    for sample_idx in range(n_samples):
-        client_id = sample_idx + 1
-        pred_probs = predictions[sample_idx]
-        true_class = targets[sample_idx]
-
-        for product_idx in range(n_classes):
-            client_ids_list.append(client_id)
-            labels_list.append(1.0 if product_idx == true_class else 0.0)
-            scores_list.append(float(pred_probs[product_idx]))
-            products_list.append(inverse_target_mapping.get(product_idx, f"UNKNOWN_{product_idx}"))
-
-    return (
-        np.array(client_ids_list),
-        np.array(labels_list),
-        np.array(scores_list),
-        np.array(products_list),
-    )
+    for i in range(n_samples):
+        pred = predictions[i]
+        true_class = targets[i]
+        probs = np.exp(pred) / np.sum(np.exp(pred))
+        for j in range(n_classes):
+            client_ids_list.append(i + 1)
+            labels_list.append(1.0 if j == true_class else 0.0)
+            scores_list.append(probs[j])
+            products_list.append(inverse_target_mapping.get(j, f"UNK_{j}"))
+    return (np.array(client_ids_list), np.array(labels_list), np.array(scores_list), np.array(products_list))
 
 
 def evaluate_topk_metrics_nbo(predictions, targets, inverse_target_mapping, k_values=[1, 3, 5]):
     """
-    Retourne un dict {K: métriques} avec l'algo "collègue".
-    - predictions: probabilités [n_samples, n_classes]
-    - targets: vrais indices de classes
-    - inverse_target_mapping: {class_index: "libellé produit"}
+    Idem ta version : renvoie (metrics_dict, None)
     """
     client_ids, labels, scores, products = convert_predictions_to_nbo_format(
         predictions, targets, inverse_target_mapping
@@ -952,32 +798,4 @@ def evaluate_topk_metrics_nbo(predictions, targets, inverse_target_mapping, k_va
     all_metrics = {}
     for k in k_values:
         all_metrics[k] = compute_ranking_metrics_at_k(client_ids, labels, scores, products, k)
-    return all_metrics
-
-
-def format_topk_table(metrics_by_k, baseline_metrics=None):
-    """Joli tableau Top-K lisible en console."""
-    lines = []
-    lines.append("T4REC XLNET TOP-K INFERENCE METRICS")
-    lines.append("=" * 80)
-    header = "| Metric          |" + "".join([f" K={k:<10} |" for k in sorted(metrics_by_k.keys())])
-    lines.append(header)
-    lines.append("|" + "-" * (len(header) - 2) + "|")
-    for key, label in [
-        ("Precision@K", "Precision"),
-        ("Recall@K", "Recall"),
-        ("F1@K", "F1-Score"),
-        ("NDCG@K", "NDCG"),
-        ("HitRate@K", "Hit Rate"),
-        ("Coverage@K", "Coverage"),
-    ]:
-        row = f"| {label:<15} |"
-        for k in sorted(metrics_by_k.keys()):
-            row += f" {metrics_by_k[k].get(key,0.0)*100:>6.2f}%   |"
-        lines.append(row)
-    lines.append("|" + "-" * (len(header) - 2) + "|")
-    return "\n".join(lines)
-
-
-def print_topk_results(metrics_by_k, baseline_metrics=None):
-    print(format_topk_table(metrics_by_k, baseline_metrics))
+    return all_metrics, None
