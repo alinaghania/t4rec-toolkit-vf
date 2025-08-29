@@ -689,10 +689,10 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
                 val: int((target_lower == val).sum()) for val in exclude_lower
             }
             logger.info(
-                f"🔍 EXCLUSION ANALYSIS - Target values to exclude: {exclude_vals}"
+                f"EXCLUSION ANALYSIS - Target values to exclude: {exclude_vals}"
             )
             logger.info(
-                f"📊 BEFORE filtering: {counts_before} out of {before_n} total rows"
+                f"BEFORE filtering: {counts_before} out of {before_n} total rows"
             )
 
             # Détail par valeur exclue
@@ -700,7 +700,7 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
                 count = counts_before.get(str(exclude_val).lower(), 0)
                 percentage = (count / before_n * 100) if before_n > 0 else 0
                 logger.info(
-                    f"   └── '{exclude_val}': {count:,} rows ({percentage:.2f}%)"
+                    f"   -> '{exclude_val}': {count:,} rows ({percentage:.2f}%)"
                 )
 
         except Exception as e:
@@ -717,17 +717,17 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
 
         if config["runtime"]["verbose"]:
             logger.info(
-                f"✅ EXCLUSION COMPLETE - Removed {removed_n:,} rows ({removed_n / before_n * 100:.2f}%)"
+                f"EXCLUSION COMPLETE - Removed {removed_n:,} rows ({removed_n / before_n * 100:.2f}%)"
             )
-            logger.info(f"📋 Remaining rows: {len(df):,}")
+            logger.info(f"Remaining rows: {len(df):,}")
 
             if remaining_after > 0:
                 logger.warning(
-                    f"⚠️  Still {remaining_after} excluded values remaining (should be 0!)"
+                    f"Still {remaining_after} excluded values remaining (should be 0!)"
                 )
             else:
                 logger.info(
-                    f"✨ SUCCESS: All '{exclude_vals}' values successfully excluded!"
+                    f"SUCCESS: All '{exclude_vals}' values successfully excluded!"
                 )
 
         if len(df) == 0:
@@ -1210,30 +1210,40 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
                 if len(prediction_scores) > 0:
                     logger.info("Calculating Top-K metrics for metrics dataset...")
                     k_values = [1, 3, 5, 10]
-                    topk_metrics = evaluate_topk_metrics_advanced(
+
+                    # Utiliser le code exact du collègue
+                    topk_metrics = evaluate_topk_metrics_nbo(
                         predictions=prediction_scores,
                         targets=true_labels,
+                        inverse_target_mapping=inverse_target_mapping,
                         k_values=k_values,
                     )
 
-                    # Add Top-K metrics to list
+                    # Add Top-K metrics to list (utiliser les noms exacts du collègue)
                     for k in k_values:
                         if k in topk_metrics:
                             k_data = topk_metrics[k]
-                            topk_metrics_to_save = [
-                                ("precision_at_k", k_data.get("precision", 0.0)),
-                                ("recall_at_k", k_data.get("recall", 0.0)),
-                                ("f1_at_k", k_data.get("f1", 0.0)),
-                                ("ndcg_at_k", k_data.get("ndcg", 0.0)),
-                                ("hit_rate_at_k", k_data.get("hit_rate", 0.0)),
+                            # Utiliser les noms exacts du collègue
+                            colleague_metrics_to_save = [
+                                ("precision_at_k", k_data.get("Precision@K", 0.0)),
+                                ("recall_at_k", k_data.get("Recall@K", 0.0)),
+                                ("f1_at_k", k_data.get("F1@K", 0.0)),
+                                ("ndcg_at_k", k_data.get("NDCG@K", 0.0)),
+                                ("map", k_data.get("MAP", 0.0)),
+                                ("hit_rate_at_k", k_data.get("HitRate@K", 0.0)),
+                                ("coverage_at_k", k_data.get("Coverage@K", 0.0)),
+                                (
+                                    "clients_evaluated",
+                                    k_data.get("Clients_evaluated", 0),
+                                ),
                             ]
 
-                            for metric_name, metric_value in topk_metrics_to_save:
+                            for metric_name, metric_value in colleague_metrics_to_save:
                                 metrics_list.append(
                                     {
                                         "metric_name": metric_name,
                                         "metric_value": float(metric_value),
-                                        "metric_type": "topk",
+                                        "metric_type": "topk_nbo",
                                         "dataset_split": "validation",
                                         "k_value": k,
                                         "timestamp": pd.Timestamp.now(),
@@ -1661,3 +1671,173 @@ def get_config_schema() -> Dict[str, Any]:
             },
         },
     }
+
+
+def compute_ranking_metrics_at_k(client_ids, labels, scores, products, k):
+    """
+    Calcule les métriques de ranking à k pour un système NBO (Next Best Offer),
+    en excluant les clients n'ayant aucun label = 1 (sauf pour Coverage@K).
+
+    Paramètres
+    ----------
+    client_ids : array-like
+        Liste ou array des identifiants clients (répétés ligne à ligne).
+    labels : array-like
+        Liste ou array des labels binaires (0 ou 1), 1 = souscription.
+    scores : array-like
+        Scores de ranking calibrés (e.g., proba_iso).
+    products : array-like
+        Identifiants ou noms des produits associés à chaque ligne.
+    k : int
+        Nombre de recommandations à considérer pour les métriques top-K.
+
+    Retour
+    ------
+    dict : dictionnaire contenant les métriques de ranking moyennées par client.
+    """
+    from sklearn.metrics import ndcg_score, average_precision_score
+    from collections import defaultdict
+
+    client_data = defaultdict(list)
+    for cid, label, score, prod in zip(client_ids, labels, scores, products):
+        client_data[cid].append((label, score, prod))
+
+    ndcgs, aps, recalls, f1s = [], [], [], []
+    hit_count = 0
+    recommended_products = set()
+    precision_topk_total = 0
+    topk_count = 0
+    valid_clients = 0
+
+    for cid, items in client_data.items():
+        y_true = np.array([l for l, _, _ in items], dtype=float)
+        y_score = np.array([s for _, s, _ in items], dtype=float)
+        y_prods = np.array([p for _, _, p in items])
+
+        if y_true.sum() == 0 or len(y_true) < 2 or np.isnan(y_score).any():
+            continue  # Skip clients sans label positif
+
+        valid_clients += 1
+        # Tri décroissant par score
+        top_k_idx = np.argsort(y_score)[::-1][:k]
+        y_topk = y_true[top_k_idx]
+        p_topk = y_prods[top_k_idx]
+
+        # Precision@K (globale)
+        precision_topk_total += y_topk.sum()
+        topk_count += k
+
+        # Per-client metrics
+        ndcgs.append(ndcg_score([y_true], [y_score], k=k))
+        aps.append(average_precision_score(y_true, y_score))
+
+        recall_at_k = y_topk.sum() / y_true.sum()
+        recalls.append(recall_at_k)
+
+        prec_k = y_topk.sum() / k
+        rec_k = recall_at_k
+        if prec_k + rec_k > 0:
+            f1s.append(2 * (prec_k * rec_k) / (prec_k + rec_k))
+
+        if y_topk.sum() > 0:
+            hit_count += 1
+
+        recommended_products.update(p_topk)
+
+    return {
+        "Precision@K": precision_topk_total / topk_count if topk_count > 0 else np.nan,
+        "Recall@K": np.mean(recalls) if recalls else np.nan,
+        "F1@K": np.mean(f1s) if f1s else np.nan,
+        "NDCG@K": np.mean(ndcgs) if ndcgs else np.nan,
+        "MAP": np.mean(aps) if aps else np.nan,
+        "HitRate@K": hit_count / valid_clients if valid_clients > 0 else np.nan,
+        "Coverage@K": len(recommended_products) / len(set(products))
+        if len(products) > 0
+        else np.nan,
+        "Clients_evaluated": valid_clients,
+    }
+
+
+def convert_predictions_to_nbo_format(predictions, targets, inverse_target_mapping):
+    """
+    Convertit nos prédictions T4Rec vers le format NBO attendu
+
+    Args:
+        predictions: Matrice de prédictions [n_samples, n_classes]
+        targets: Array des vraies classes [n_samples]
+        inverse_target_mapping: Dict mapping encoded_class -> original_product_name
+
+    Returns:
+        Tuple (client_ids, labels, scores, products) compatible avec compute_ranking_metrics_at_k
+    """
+    client_ids_list = []
+    labels_list = []
+    scores_list = []
+    products_list = []
+
+    n_samples, n_classes = predictions.shape
+
+    # Pour chaque échantillon (client)
+    for sample_idx in range(n_samples):
+        client_id = sample_idx + 1  # ID client séquentiel
+        pred_scores = predictions[sample_idx]  # Scores pour tous les produits
+        true_class = targets[sample_idx]  # Vraie classe pour ce client
+
+        # Convertir logits en probabilités (softmax)
+        pred_probs = np.exp(pred_scores) / np.sum(np.exp(pred_scores))
+
+        # Pour chaque produit, créer une ligne
+        for product_idx in range(n_classes):
+            client_ids_list.append(client_id)
+
+            # Label binaire : 1 si c'est le vrai produit, 0 sinon
+            label = 1.0 if product_idx == true_class else 0.0
+            labels_list.append(label)
+
+            # Score de prédiction pour ce produit
+            scores_list.append(pred_probs[product_idx])
+
+            # Nom du produit (original du dataset)
+            product_name = inverse_target_mapping.get(
+                product_idx, f"UNKNOWN_PRODUCT_{product_idx}"
+            )
+            products_list.append(product_name)
+
+    return (
+        np.array(client_ids_list),
+        np.array(labels_list),
+        np.array(scores_list),
+        np.array(products_list),
+    )
+
+
+def evaluate_topk_metrics_nbo(
+    predictions, targets, inverse_target_mapping, k_values=[1, 3, 5]
+):
+    """
+    Utilise exactement le même algorithme que ronan pour les métriques NBO
+
+    Args:
+        predictions: Nos prédictions T4Rec [n_samples, n_classes]
+        targets: Nos targets [n_samples]
+        inverse_target_mapping: Mapping encoded_class -> original_product_name
+        k_values: Liste des valeurs K à évaluer
+
+    Returns:
+        Dict des métriques par K (format identique collègue)
+    """
+    # Convertir nos données vers le format NBO
+    client_ids, labels, scores, products = convert_predictions_to_nbo_format(
+        predictions, targets, inverse_target_mapping
+    )
+
+    # Calculer les métriques pour chaque K
+    all_metrics = {}
+    for k in k_values:
+        metrics_k = compute_ranking_metrics_at_k(
+            client_ids, labels, scores, products, k
+        )
+        all_metrics[k] = metrics_k
+
+    return all_metrics
+
