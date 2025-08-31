@@ -1,8 +1,9 @@
-# == BUILD EVENTS (stream) ==
+# == BUILD EVENTS (pandas) ==
 from datetime import datetime
 import pandas as pd
 import dataiku
 
+# --- Paramètres (reprends tes constantes)
 DATASET_MAIN   = "BASE_SCORE_COMPLETE_prepared"
 DATASET_EVENTS = "T4REC_EVENTS_FROM_MAIN"
 CLIENT_ID_COL  = "CLIENT_ID"
@@ -10,78 +11,41 @@ TIME_COL       = "DATMAJ"
 PRODUCT_COL    = "SOUSCRIPTION_PRODUIT_1M"
 EXTRA_EVENT_COLS = []  # ex: ["CANAL", "FAMILLE_PRODUIT"]
 
-print("== BUILD EVENTS (stream) ==")
+print("== BUILD EVENTS (pandas) ==")
 print(datetime.now())
 
+# 1) Source + vérification des colonnes
 src = dataiku.Dataset(DATASET_MAIN)
-dst = dataiku.Dataset(DATASET_EVENTS)
-
-# 1) Colonnes du schéma source
-src_schema = src.get_schema()
-src_cols = [c["name"] for c in src_schema["columns"]]
+schema_cols = [c["name"] for c in src.get_schema()["columns"]]  # noms des colonnes du schéma
 needed = [CLIENT_ID_COL, TIME_COL, PRODUCT_COL] + list(EXTRA_EVENT_COLS)
-missing = [c for c in needed if c not in src_cols]
+missing = [c for c in needed if c not in schema_cols]
 if missing:
     raise ValueError(f"Colonnes absentes dans {DATASET_MAIN}: {missing}")
 
-# 2) S’assurer que le schéma cible existe (sinon créer un schéma minimal en écrivant 0 ligne)
-try:
-    _ = dst.get_schema()  # essaie de lire le schéma
-except Exception:
-    # crée un schéma minimal en écrivant un DF vide
-    empty_df = pd.DataFrame(columns=[CLIENT_ID_COL, TIME_COL, PRODUCT_COL] + list(EXTRA_EVENT_COLS))
-    dst.write_with_schema(empty_df)
+# 2) Charger seulement les colonnes utiles (RAM friendly vs full table)
+df = src.get_dataframe(columns=needed)
 
-# 3) On va bufferiser par (client, mois) pour garder uniquement la dernière occurrence
-#    -> dictionnaire clé=(client_id, month_start) -> dict ligne compacte
-from dateutil.relativedelta import relativedelta
+# 3) Nettoyage de base
+df = df.dropna(subset=[CLIENT_ID_COL, TIME_COL])                       # garde lignes avec id + date
+df[TIME_COL] = pd.to_datetime(df[TIME_COL], errors="coerce")           # parse datetime
+df = df.dropna(subset=[TIME_COL])                                      # retire dates invalides
 
-buffer_last = {}  # {(cid, month_ts): row_dict_compact}
+# 4) Bucket mensuel (début de mois) pour la dimension temporelle
+df["_month"] = df[TIME_COL].dt.to_period("M").dt.to_timestamp()        # 1er jour du mois
 
-# 4) Lecture en flux
-col_index = {name: idx for idx, name in enumerate(src_cols)}  # pour indexer rapidement le tuple
-for row_tuple in src.iter_rows():                              # tuples dans l'ordre des colonnes du schéma
-    # -- extraire uniquement les colonnes utiles
-    try:
-        cid = row_tuple[col_index[CLIENT_ID_COL]]
-        ts  = row_tuple[col_index[TIME_COL]]
-        prod = row_tuple[col_index[PRODUCT_COL]]
-    except Exception:
-        continue  # ligne anormale → skip
+# 5) 1 ligne par (client, mois) : garder la plus récente si plusieurs
+df = (df.sort_values([CLIENT_ID_COL, TIME_COL])                        # ordre chronologique
+        .drop_duplicates(subset=[CLIENT_ID_COL, "_month"], keep="last"))
 
-    if cid is None or ts is None:
-        continue
+# 6) Renommer proprement pour la table événements
+events = df[[CLIENT_ID_COL, "_month", PRODUCT_COL] + [c for c in EXTRA_EVENT_COLS if c in df.columns]].copy()
+events = events.rename(columns={"_month": TIME_COL})                    # la colonne de temps redevient TIME_COL
 
-    # -- parse date
-    try:
-        ts = pd.to_datetime(ts, errors="coerce")
-    except Exception:
-        ts = pd.NaT
-    if pd.isna(ts):
-        continue
+# 7) Écriture/sauvegarde
+dst = dataiku.Dataset(DATASET_EVENTS)
+dst.write_with_schema(events)                                           # crée/écrase avec le schéma du DF
 
-    # -- bucket mensuel (début de mois)
-    month_ts = ts.to_period("M").to_timestamp()
+print(f"✅ Events écrits dans {DATASET_EVENTS} : {events.shape}")
 
-    # -- récupérer extras (si demandés)
-    row_out = {
-        CLIENT_ID_COL: cid,
-        TIME_COL: month_ts,
-        PRODUCT_COL: prod
-    }
-    for c in EXTRA_EVENT_COLS:
-        # si la colonne est présente, on la copie telle quelle
-        if c in col_index:
-            row_out[c] = row_tuple[col_index[c]]
-
-    # -- on garde la plus récente pour (client, mois) : on remplace systématiquement
-    buffer_last[(cid, month_ts)] = row_out
-
-# 5) Écriture en flux des lignes agrégées
-with dst.get_writer() as w:
-    for _, row_out in buffer_last.items():
-        w.write_row_dict(row_out)
-
-print(f"✅ Events écrits dans {DATASET_EVENTS} : {len(buffer_last)} lignes")
 
 
