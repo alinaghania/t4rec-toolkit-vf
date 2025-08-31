@@ -1,51 +1,95 @@
-# == BUILD EVENTS (pandas) ==
+# == BUILD EVENTS (stream) — robuste, sans get_schema ==
 from datetime import datetime
 import pandas as pd
 import dataiku
 
-# --- Paramètres (reprends tes constantes)
-DATASET_MAIN   = "BASE_SCORE_COMPLETE_prepared"
-DATASET_EVENTS = "T4REC_EVENTS_FROM_MAIN"
-CLIENT_ID_COL  = "CLIENT_ID"
-TIME_COL       = "DATMAJ"
-PRODUCT_COL    = "SOUSCRIPTION_PRODUIT_1M"
-EXTRA_EVENT_COLS = []  # ex: ["CANAL", "FAMILLE_PRODUIT"]
+print("== BUILD EVENTS (stream) ==", datetime.now())
 
-print("== BUILD EVENTS (pandas) ==")
-print(datetime.now())
+# --- Paramètres requis ---
+SRC_NAME   = DATASET_MAIN                 # ex: "BASE_SCORE_COMPLETE_prepared"
+DST_NAME   = DATASET_EVENTS               # ex: "T4REC_EVENTS_FROM_MAIN"
+CID        = CLIENT_ID_COL                # ex: "CLIENT_ID"
+TCOL       = TIME_COL                     # ex: "DATMAJ"
+PCOL       = PRODUCT_COL                  # ex: "SOUSCRIPTION_PRODUIT_1M"
+EXTRA_COLS = list(EXTRA_EVENT_COLS)       # ex: []
 
-# 1) Source + vérification des colonnes
-src = dataiku.Dataset(DATASET_MAIN)
-schema_cols = [c["name"] for c in src.get_schema()["columns"]]  # noms des colonnes du schéma
-needed = [CLIENT_ID_COL, TIME_COL, PRODUCT_COL] + list(EXTRA_EVENT_COLS)
-missing = [c for c in needed if c not in schema_cols]
+# --- Ouverture datasets ---
+src = dataiku.Dataset(SRC_NAME)
+dst = dataiku.Dataset(DST_NAME)
+
+# --- Récupère la liste des colonnes de façon 100% compatible versions ---
+# 1) essai via get_config (toujours dispo)
+try:
+    cfg = src.get_config()
+    cols_in_schema = [c["name"] for c in cfg.get("schema", {}).get("columns", [])]
+except Exception:
+    cols_in_schema = []
+# 2) fallback ultra simple : lit 1 ligne pour obtenir les noms (ne consomme pas de RAM)
+if not cols_in_schema:
+    cols_in_schema = list(src.get_dataframe(limit=1).columns)
+
+# --- Vérifications colonnes nécessaires ---
+needed = [CID, TCOL, PCOL] + [c for c in EXTRA_COLS]
+missing = [c for c in needed if c not in cols_in_schema]
 if missing:
-    raise ValueError(f"Colonnes absentes dans {DATASET_MAIN}: {missing}")
+    raise ValueError(f"Colonnes absentes dans {SRC_NAME}: {missing}")
 
-# 2) Charger seulement les colonnes utiles (RAM friendly vs full table)
-df = src.get_dataframe(columns=needed)
+# --- Fonction utilitaire : normalisation/clean d'un chunk ---
+def prepare_chunk(df):
+    # Garde seulement les colonnes utiles
+    df = df[needed].copy()
 
-# 3) Nettoyage de base
-df = df.dropna(subset=[CLIENT_ID_COL, TIME_COL])                       # garde lignes avec id + date
-df[TIME_COL] = pd.to_datetime(df[TIME_COL], errors="coerce")           # parse datetime
-df = df.dropna(subset=[TIME_COL])                                      # retire dates invalides
+    # Nettoyage minimal
+    df = df.dropna(subset=[CID, TCOL])
+    df[TCOL] = pd.to_datetime(df[TCOL], errors="coerce")
+    df = df.dropna(subset=[TCOL])
 
-# 4) Bucket mensuel (début de mois) pour la dimension temporelle
-df["_month"] = df[TIME_COL].dt.to_period("M").dt.to_timestamp()        # 1er jour du mois
+    # IMPORTANT: on ne déduplique que **dans le chunk** pour réduire le volume ;
+    # d’éventuels doublons (CID, TCOL) à cheval sur 2 chunks seront gérés
+    # plus loin par le SequenceBuilder (qui prend le dernier évènement du bucket).
+    df = df.sort_values([CID, TCOL]).drop_duplicates(subset=[CID, TCOL], keep="last")
+    return df
 
-# 5) 1 ligne par (client, mois) : garder la plus récente si plusieurs
-df = (df.sort_values([CLIENT_ID_COL, TIME_COL])                        # ordre chronologique
-        .drop_duplicates(subset=[CLIENT_ID_COL, "_month"], keep="last"))
+# --- Écriture streaming : premier chunk = write_with_schema, suivants = append ---
+CHUNK = 100_000  # ajuste si besoin (50k~200k selon RAM/format)
+first = True
+n_rows_out = 0
+n_chunks = 0
 
-# 6) Renommer proprement pour la table événements
-events = df[[CLIENT_ID_COL, "_month", PRODUCT_COL] + [c for c in EXTRA_EVENT_COLS if c in df.columns]].copy()
-events = events.rename(columns={"_month": TIME_COL})                    # la colonne de temps redevient TIME_COL
+# iter_dataframes est la voie normale pour streamer sans OOM
+if hasattr(src, "iter_dataframes"):
+    for raw in src.iter_dataframes(chunksize=CHUNK):
+        n_chunks += 1
+        df_chunk = prepare_chunk(raw)
+        if df_chunk.empty:
+            continue
+        if first:
+            # crée/écrase le dataset de sortie avec le bon schéma automatiquement
+            dst.write_with_schema(df_chunk)
+            first = False
+        else:
+            # append performant (si write_dataframe indisponible on bascule en lignes)
+            w = dst.get_writer()
+            try:
+                w.write_dataframe(df_chunk)
+            except Exception:
+                for rec in df_chunk.to_dict(orient="records"):
+                    w.write_row_dict(rec)
+            finally:
+                w.close()
+        n_rows_out += len(df_chunk)
+        print(f"  wrote chunk {n_chunks:,} → {len(df_chunk):,} rows (total {n_rows_out:,})")
+else:
+    # Fallback ultime (versions très anciennes): lecture complète (risque d'OOM).
+    # Utilise-le seulement sur un sous-ensemble (ex: limit=1_000_000) si RAM limitée.
+    print("⚠️ iter_dataframes() indisponible: fallback lecture complète (attention RAM).")
+    raw = src.get_dataframe()  # <-- à éviter si > RAM
+    df_chunk = prepare_chunk(raw)
+    dst.write_with_schema(df_chunk)
+    n_chunks = 1
+    n_rows_out = len(df_chunk)
 
-# 7) Écriture/sauvegarde
-dst = dataiku.Dataset(DATASET_EVENTS)
-dst.write_with_schema(events)                                           # crée/écrase avec le schéma du DF
-
-print(f"✅ Events écrits dans {DATASET_EVENTS} : {events.shape}")
+print(f"✅ EVENTS BUILT → {DST_NAME}: {n_rows_out:,} rows in {n_chunks} chunk(s)")
 
 
 
