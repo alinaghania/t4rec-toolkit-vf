@@ -1,21 +1,14 @@
-# === NOTEBOOK CELL : BUILD EVENTS DATASET (STREAMED, FIXED) ===
-import pandas as pd
-import numpy as np
+# == BUILD EVENTS (stream) ==
 from datetime import datetime
+import pandas as pd
 import dataiku
 
-# ---- Paramètres
 DATASET_MAIN   = "BASE_SCORE_COMPLETE_prepared"
 DATASET_EVENTS = "T4REC_EVENTS_FROM_MAIN"
-
 CLIENT_ID_COL  = "CLIENT_ID"
-TIME_COL       = "DATMAJ"                    # Datetime-like (ex: 2024-07-31)
+TIME_COL       = "DATMAJ"
 PRODUCT_COL    = "SOUSCRIPTION_PRODUIT_1M"
-EXTRA_EVENT_COLS = []                        # ex: ["CANAL", "FAMILLE"]
-
-TARGET_EXCLUDE = {"aucune_souscription"}     # réduit la taille
-CHUNK_ROWS     = 200_000                     # buffer RAM
-ASSUME_PARTITIONED = True                    # si le dataset cible est partitionné (yyyy-MM)
+EXTRA_EVENT_COLS = []  # ex: ["CANAL", "FAMILLE_PRODUIT"]
 
 print("== BUILD EVENTS (stream) ==")
 print(datetime.now())
@@ -23,84 +16,72 @@ print(datetime.now())
 src = dataiku.Dataset(DATASET_MAIN)
 dst = dataiku.Dataset(DATASET_EVENTS)
 
-# --- Vérif colonnes (fix API) ---
-schema_cols = [c["name"] for c in src.read_schema()]  # <== CORRIGÉ
-cols_needed = [CLIENT_ID_COL, TIME_COL, PRODUCT_COL] + [c for c in EXTRA_EVENT_COLS]
-missing = [c for c in cols_needed if c not in schema_cols]
+# 1) Colonnes du schéma source
+src_schema = src.get_schema()
+src_cols = [c["name"] for c in src_schema["columns"]]
+needed = [CLIENT_ID_COL, TIME_COL, PRODUCT_COL] + list(EXTRA_EVENT_COLS)
+missing = [c for c in needed if c not in src_cols]
 if missing:
     raise ValueError(f"Colonnes absentes dans {DATASET_MAIN}: {missing}")
 
-# --- Writer helper (gère partitionné / non partitionné) ---
-def write_chunk(df: pd.DataFrame):
-    """Ecrit un chunk dans DATASET_EVENTS. On suppose partition mensuelle 'yyyy-MM' si possible."""
-    if df.empty:
-        return
-    df = df.copy()
-    # bucket mensuel
-    df["_bucket"] = pd.to_datetime(df[TIME_COL], errors="coerce").dt.to_period("M").dt.to_timestamp()
-    # dédup par (client, mois) en gardant la ligne la plus récente
-    df = (df.sort_values([CLIENT_ID_COL, TIME_COL])
-            .drop_duplicates(subset=[CLIENT_ID_COL, "_bucket"], keep="last"))
-    # partition string
-    df["_part"] = df["_bucket"].dt.strftime("%Y-%m")
+# 2) S’assurer que le schéma cible existe (sinon créer un schéma minimal en écrivant 0 ligne)
+try:
+    _ = dst.get_schema()  # essaie de lire le schéma
+except Exception:
+    # crée un schéma minimal en écrivant un DF vide
+    empty_df = pd.DataFrame(columns=[CLIENT_ID_COL, TIME_COL, PRODUCT_COL] + list(EXTRA_EVENT_COLS))
+    dst.write_with_schema(empty_df)
 
-    # colonnes finales à écrire
-    to_write = df.drop(columns=["_bucket"]).copy()
+# 3) On va bufferiser par (client, mois) pour garder uniquement la dernière occurrence
+#    -> dictionnaire clé=(client_id, month_start) -> dict ligne compacte
+from dateutil.relativedelta import relativedelta
 
-    if ASSUME_PARTITIONED:
-        # on tente le mode partitionné; si ça explose, on fallback non-partitionné
-        try:
-            for part, sub in to_write.groupby("_part"):
-                with dst.get_writer(partition=str(part)) as w:
-                    for row in sub.drop(columns=["_part"]).to_dict(orient="records"):
-                        w.write_row_dict(row)
-            return
-        except Exception as e:
-            print(f"⚠️ Partition write failed ({e}); fallback en non partitionné.")
-            # on continue en non partitionné
+buffer_last = {}  # {(cid, month_ts): row_dict_compact}
 
-    # non partitionné
-    with dst.get_writer() as w:
-        for row in to_write.drop(columns=["_part"]).to_dict(orient="records"):
-            w.write_row_dict(row)
+# 4) Lecture en flux
+col_index = {name: idx for idx, name in enumerate(src_cols)}  # pour indexer rapidement le tuple
+for row_tuple in src.iter_rows():                              # tuples dans l'ordre des colonnes du schéma
+    # -- extraire uniquement les colonnes utiles
+    try:
+        cid = row_tuple[col_index[CLIENT_ID_COL]]
+        ts  = row_tuple[col_index[TIME_COL]]
+        prod = row_tuple[col_index[PRODUCT_COL]]
+    except Exception:
+        continue  # ligne anormale → skip
 
-# --- Boucle stream ---
-buf = []
-rows_in_total = 0
-rows_out_total = 0
-select_cols = cols_needed  # lecture restreinte
+    if cid is None or ts is None:
+        continue
 
-for row in src.iter_rows(columns=select_cols):
-    buf.append(row)
-    if len(buf) >= CHUNK_ROWS:
-        df = pd.DataFrame(buf)
-        buf.clear()
+    # -- parse date
+    try:
+        ts = pd.to_datetime(ts, errors="coerce")
+    except Exception:
+        ts = pd.NaT
+    if pd.isna(ts):
+        continue
 
-        # nettoyage minimal
-        df = df.dropna(subset=[CLIENT_ID_COL, TIME_COL])
-        df[TIME_COL] = pd.to_datetime(df[TIME_COL], errors="coerce")
-        df = df.dropna(subset=[TIME_COL])
+    # -- bucket mensuel (début de mois)
+    month_ts = ts.to_period("M").to_timestamp()
 
-        # filtre label (réduit volume)
-        df = df[~df[PRODUCT_COL].astype(str).str.lower().isin(TARGET_EXCLUDE)]
+    # -- récupérer extras (si demandés)
+    row_out = {
+        CLIENT_ID_COL: cid,
+        TIME_COL: month_ts,
+        PRODUCT_COL: prod
+    }
+    for c in EXTRA_EVENT_COLS:
+        # si la colonne est présente, on la copie telle quelle
+        if c in col_index:
+            row_out[c] = row_tuple[col_index[c]]
 
-        write_chunk(df)
-        rows_in_total += len(df)
-        rows_out_total += len(df)
-        print(f"  wrote chunk — rows_in_total={rows_in_total:,}")
+    # -- on garde la plus récente pour (client, mois) : on remplace systématiquement
+    buffer_last[(cid, month_ts)] = row_out
 
-# flush final
-if buf:
-    df = pd.DataFrame(buf)
-    buf.clear()
-    df = df.dropna(subset=[CLIENT_ID_COL, TIME_COL])
-    df[TIME_COL] = pd.to_datetime(df[TIME_COL], errors="coerce")
-    df = df.dropna(subset=[TIME_COL])
-    df = df[~df[PRODUCT_COL].astype(str).str.lower().isin(TARGET_EXCLUDE)]
-    write_chunk(df)
-    rows_in_total += len(df)
-    rows_out_total += len(df)
+# 5) Écriture en flux des lignes agrégées
+with dst.get_writer() as w:
+    for _, row_out in buffer_last.items():
+        w.write_row_dict(row_out)
 
-print("== DONE ==")
-print(f"Rows written (before de-dup per month): {rows_out_total:,}")
+print(f"✅ Events écrits dans {DATASET_EVENTS} : {len(buffer_last)} lignes")
+
 
