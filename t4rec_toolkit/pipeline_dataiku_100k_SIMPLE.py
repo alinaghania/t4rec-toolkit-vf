@@ -2,134 +2,123 @@
 # -*- coding: utf-8 -*-
 
 """
-BUILD EVENTS (in-memory, robust, with LIMIT and full-count)
-- Zéro appel à get_info()/get_schema()
-- Détecte les colonnes via get_dataframe(limit=0)
-- Lecture par chunks sans parse_dates automatique (évite bugs d'index)
-- Normalise DATMAJ en tz-naive, filtre dernière N mois, déduplique (client, date)
-- Agrège jusqu'à LIMIT_MAX lignes, puis continue en "count only" pour donner le total sans limite
+BUILD EVENTS (in-memory, robust to DSS/Pandas parser quirks)
+- Lit le dataset principal en chunks (sans 'columns=' pour éviter les bugs parse_dates/index)
+- Garde seulement les colonnes nécessaires en mémoire
+- Cast DATMAJ en tz-naive, filtre sur les N derniers mois, déduplique (client, date)
+- S'arrête exactement à LIMIT_ROWS (hard stop)
+- Donne df_events utilisable directement pour la suite du pipeline
 """
 
 import dataiku
 import pandas as pd
 from datetime import datetime
 
-# ------------ CONFIG ------------
-DATASET_MAIN     = "BASE_SCORE_COMPLETE_prepared"
-CLIENT_ID_COL    = "NUMTECPRS"                    # id client (remplacé demandé)
-TIME_COL         = "DATMAJ"                       # datetime
-PRODUCT_COL      = "SOUSCRIPTION_PRODUIT_1M"      # produit / item
-EXTRA_EVENT_COLS = []                             
-KEEP_MONTHS      = 24                             # garder les N derniers mois
-CHUNKSIZE        = 200_000                        # chunk size
-LIMIT_MAX        = 3_000_000                      # limite d'agrégation en mémoire
-PROGRESS_EVERY   = 200_000                        # fréquence d'affichage progression
-# --------------------------------
+# ---------------- CONFIG ----------------
+DATASET_MAIN     = "BASE_SCORE_COMPLETE_prepared"  # dataset source
+CLIENT_ID_COL    = "NUMTECPRS"                     # id client
+TIME_COL         = "DATMAJ"                        # colonne datetime
+PRODUCT_COL      = "SOUSCRIPTION_PRODUIT_1M"       # produit / item
+EXTRA_EVENT_COLS = []                               # ex: ["CANAL", "FAMILLE"]
+KEEP_MONTHS      = 24                               # ne garder que les N derniers mois (None pour désactiver)
+CHUNKSIZE        = 200_000                          # taille de chunk (ajuste si RAM serrée)
+LIMIT_ROWS       = 1_000_000                        # 🔥 limite stricte sur le nombre de lignes en sortie
+# -----------------------------------------
 
 print("== BUILD EVENTS (memory) ==", datetime.now())
 
+# 0) Dataset & découverte colonnes sans API non-portable
 src = dataiku.Dataset(DATASET_MAIN)
-
-# Récupération "safe" des colonnes disponibles
 try:
-    schema_cols = list(src.get_dataframe(limit=0).columns)
+    schema_cols = list(src.get_dataframe(limit=0).columns)  # vide mais avec colonnes
 except Exception:
-    # vieux DSS : lire la conf pour retrouver les colonnes déclarées
+    # fallback vieux DSS
     cfg = src.get_config()
     schema_cols = [c["name"] for c in cfg.get("schema", {}).get("columns", [])]
 
-cols_needed = [CLIENT_ID_COL, TIME_COL, PRODUCT_COL] + list(EXTRA_EVENT_COLS)
+cols_needed = [CLIENT_ID_COL, TIME_COL, PRODUCT_COL] + EXTRA_EVENT_COLS
 missing = [c for c in cols_needed if c not in schema_cols]
 if missing:
-    raise ValueError(f"Colonnes absentes dans {DATASET_MAIN}: {missing}")
+    raise ValueError(f"Colonnes manquantes dans {DATASET_MAIN}: {missing}")
 
 keep_set = set(cols_needed)
 
-# Compteurs
-rows_kept_total_no_limit = 0   # après filtres & dédupes, si on ne limitait pas
-rows_kept_aggregated     = 0   # réellement agrégées dans df_events (≤ LIMIT_MAX)
-rows_scanned_raw         = 0   # lignes brutes lues (avant filtres)
-
+# 1) Lecture chunkée SANS 'columns=' ni parse_dates auto
 chunks = []
-print_every_next = PROGRESS_EVERY
+rows_total = 0
 
 for chunk in src.iter_dataframes(
     chunksize=CHUNKSIZE,
-    parse_dates=False,          # pas de parse auto => on contrôle
+    parse_dates=False,          # on parse nous-mêmes
     infer_with_pandas=True
 ):
-    rows_scanned_raw += len(chunk)
-
-    # 1) Trim aux colonnes utiles
+    # 1.a) Réduction aux colonnes utiles (ignore extras imprévues)
     inter = [c for c in chunk.columns if c in keep_set]
+    if not inter:  # chunk ne contient aucune de nos colonnes (rare)
+        continue
     chunk = chunk[inter]
 
-    # 2) Drop NA id/date
+    # 1.b) Nettoyage minimal
     chunk = chunk.dropna(subset=[CLIENT_ID_COL, TIME_COL])
-    if chunk.empty:
-        # progress
-        if rows_scanned_raw >= print_every_next:
-            print(f" scanned={rows_scanned_raw:,} | kept(no-limit)={rows_kept_total_no_limit:,} | aggregated={rows_kept_aggregated:,}")
-            print_every_next += PROGRESS_EVERY
-        continue
 
-    # 3) Parse DATMAJ → tz-aware → strip tz → tz-naive
+    # 1.c) Datetime robuste → tz-aware → tz-naive
     dt = pd.to_datetime(chunk[TIME_COL], errors="coerce", utc=True)
+    # drop tz (naive) pour éviter toute comparaison tz-aware vs tz-naive
     dt = dt.dt.tz_convert(None)
     chunk[TIME_COL] = dt
     chunk = chunk.dropna(subset=[TIME_COL])
-    if chunk.empty:
-        if rows_scanned_raw >= print_every_next:
-            print(f" scanned={rows_scanned_raw:,} | kept(no-limit)={rows_kept_total_no_limit:,} | aggregated={rows_kept_aggregated:,}")
-            print_every_next += PROGRESS_EVERY
-        continue
 
-    # 4) Filtre temporel (dernier N mois)
+    # 1.d) Filtre temporel (derniers N mois)
     if KEEP_MONTHS is not None:
         cutoff = pd.Timestamp.now().normalize() - pd.DateOffset(months=KEEP_MONTHS)
         chunk = chunk[chunk[TIME_COL] >= cutoff]
-        if chunk.empty:
-            if rows_scanned_raw >= print_every_next:
-                print(f" scanned={rows_scanned_raw:,} | kept(no-limit)={rows_kept_total_no_limit:,} | aggregated={rows_kept_aggregated:,}")
-                print_every_next += PROGRESS_EVERY
-            continue
 
-    # 5) Dédupe (client, date) en gardant la dernière
+    if chunk.empty:
+        continue
+
+    # 1.e) Dédup (client, date) → garder la + récente
     chunk = (
         chunk.sort_values([CLIENT_ID_COL, TIME_COL])
              .drop_duplicates(subset=[CLIENT_ID_COL, TIME_COL], keep="last")
     )
 
-    # Compte "no-limit" d'abord
-    rows_kept_total_no_limit += len(chunk)
+    if chunk.empty:
+        continue
 
-    # 6) Agrégation sous LIMIT_MAX
-    remaining = max(0, LIMIT_MAX - rows_kept_aggregated)
-    if remaining > 0:
-        if len(chunk) <= remaining:
-            chunks.append(chunk)
-            rows_kept_aggregated += len(chunk)
-        else:
-            # on prend juste la part qui rentre dans la limite
-            chunks.append(chunk.iloc[:remaining].copy())
-            rows_kept_aggregated += remaining
-            # le reste du chunk continue d'être compté via rows_kept_total_no_limit (déjà fait)
+    # 1.f) Application stricte de la limite (exacte)
+    remaining = LIMIT_ROWS - rows_total
+    if remaining <= 0:
+        print(f"STOP: limite {LIMIT_ROWS:,} atteinte.")
+        break
 
-    # Progression périodique
-    if rows_scanned_raw >= print_every_next:
-        pct = (rows_kept_aggregated / LIMIT_MAX * 100.0) if LIMIT_MAX > 0 else 0.0
-        print(f" scanned={rows_scanned_raw:,} | kept(no-limit)={rows_kept_total_no_limit:,} | aggregated={rows_kept_aggregated:,} ({pct:.1f}% of LIMIT)")
-        print_every_next += PROGRESS_EVERY
+    if len(chunk) > remaining:
+        # on tronque le chunk pour respecter exactement LIMIT_ROWS
+        chunk = chunk.iloc[:remaining]
 
-# Concat final
-import pandas as pd as _pd  # avoid shadowing if any
-df_events = pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame(columns=cols_needed)
+    chunks.append(chunk)
+    rows_total += len(chunk)
 
+    # Log progression
+    print(f"   + {len(chunk):,} rows (cumulative={rows_total:,})")
+
+    if rows_total >= LIMIT_ROWS:
+        print(f"STOP: limite {LIMIT_ROWS:,} atteinte.")
+        break
+
+# 2) Concat final
+if chunks:
+    df_events = pd.concat(chunks, ignore_index=True)
+else:
+    df_events = pd.DataFrame(columns=cols_needed)
+
+# 3) Résumé
 print("== DONE ==")
-print(f"Raw scanned rows      : {rows_scanned_raw:,}")
-print(f"Kept (no limit) rows  : {rows_kept_total_no_limit:,}   # après filtres & dédupes")
-print(f"Aggregated (LIMIT)    : {rows_kept_aggregated:,} / {LIMIT_MAX:,}")
-print("df_events shape       :", df_events.shape)
+print(f"Final events shape : {df_events.shape}")
 print(df_events.head(10))
 
+# À ce stade :
+# - df_events contient uniquement NUMTECPRS, DATMAJ, SOUSCRIPTION_PRODUIT_1M (+ extras éventuels)
+# - Chaque (client, date) est unique, sur les {KEEP_MONTHS} derniers mois
+# - Taille <= LIMIT_ROWS
+# - Prêt à être ingéré par votre SequenceBuilder / pipeline_core.run_training
 
