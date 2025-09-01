@@ -168,51 +168,84 @@ def _setup_logging(verbose: bool) -> None:
 
 def _load_events_df(cfg: Dict[str, Any]) -> pd.DataFrame:
     """
-    Charge le dataset d'événements (obligatoire pour la dimension temporelle).
-    Le dataset doit contenir au minimum :
-      - client_id_col
-      - event_time_col (datetime-like)
-      - product_col (id produit)
-    """
-    if not _HAS_DATAIKU:
-        raise RuntimeError("Dataiku nécessaire pour charger les datasets.")
+    Charge les événements :
+      1) si cfg["data"]["events_df"] (DataFrame en mémoire) est fourni → priorité
+      2) sinon lit le dataset Dataiku cfg["data"]["events_dataset"]
 
+    Colonnes requises : client_id_col, event_time_col, product_col.
+    """
     logger = logging.getLogger(__name__)
     dcfg = cfg["data"]
-    ds_name = dcfg["events_dataset"]
+
+    # ---- 1) Mode mémoire (prioritaire) ----
+    if dcfg.get("events_df") is not None:
+        df = dcfg["events_df"]
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            raise ValueError("data.events_df fourni mais vide ou non-DataFrame.")
+
+        cid = dcfg["client_id_col"]
+        tcol = dcfg["event_time_col"]
+        pcol = dcfg["product_col"]
+        missing = [c for c in (cid, tcol, pcol) if c not in df.columns]
+        if missing:
+            raise ValueError(f"Colonnes manquantes dans events_df: {missing}")
+
+        # normalisation datetime (tz-naive)
+        df = df.copy()
+        dt = pd.to_datetime(df[tcol], errors="coerce", utc=True)
+        df[tcol] = dt.dt.tz_convert(None)
+        df = df.dropna(subset=[tcol])
+        logger.info(f"[events_df] (in-memory) → {df.shape}")
+        return df
+
+    # ---- 2) Mode Dataiku (fallback) ----
+    if not _HAS_DATAIKU:
+        raise RuntimeError("Dataiku requis pour lire data.events_dataset (ou bien passer data.events_df).")
+
+    ds_name = dcfg.get("events_dataset") or ""
     if not ds_name:
-        raise ValueError("data.events_dataset est requis (séquences temporelles).")
+        raise ValueError("data.events_dataset est requis si data.events_df n'est pas fourni.")
 
     ds = dataiku.Dataset(ds_name)
     df = ds.get_dataframe(limit=dcfg.get("limit"))
     logger.info(f"Events loaded: {ds_name} → {df.shape}")
 
-    # Renommer pour simplifier le code interne
     cid = dcfg["client_id_col"]
     tcol = dcfg["event_time_col"]
     pcol = dcfg["product_col"]
-    if tcol not in df.columns or cid not in df.columns or pcol not in df.columns:
-        raise ValueError(
-            f"Colonnes requises manquantes dans events: "
-            f"{cid}, {tcol}, {pcol}."
-        )
+    missing = [c for c in (cid, tcol, pcol) if c not in df.columns]
+    if missing:
+        raise ValueError(f"Colonnes manquantes dans events: {missing}")
 
-    # Ensure datetime
     df[tcol] = pd.to_datetime(df[tcol], errors="coerce")
-    df = df.dropna(subset=[tcol])  # retire lignes non datées
+    df = df.dropna(subset=[tcol])
     return df
+
 
 
 def _load_profile_df_if_any(cfg: Dict[str, Any]) -> Optional[pd.DataFrame]:
     """
-    Charge la table profil si "dataset_name" est fourni.
-    (Optionnelle : utile pour features catégorielles/statique par client)
+    Charge la table profil :
+      1) si cfg["data"]["profile_df"] (DataFrame en mémoire) est fourni → priorité
+      2) sinon lit le dataset Dataiku cfg["data"]["dataset_name"] si présent
+      3) sinon None
     """
+    logger = logging.getLogger(__name__)
+    dcfg = cfg["data"]
+
+    # ---- 1) Mode mémoire ----
+    if dcfg.get("profile_df") is not None:
+        df = dcfg["profile_df"]
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            logger.warning("data.profile_df fourni mais vide ou non-DataFrame → ignoré.")
+            return None
+        logger.info(f"[profile_df] (in-memory) → {df.shape}")
+        return df
+
+    # ---- 2) Mode Dataiku ----
     if not _HAS_DATAIKU:
         return None
 
-    logger = logging.getLogger(__name__)
-    dcfg = cfg["data"]
     ds_name = dcfg.get("dataset_name")
     if not ds_name:
         return None
@@ -221,6 +254,7 @@ def _load_profile_df_if_any(cfg: Dict[str, Any]) -> Optional[pd.DataFrame]:
     df = ds.get_dataframe(limit=dcfg.get("limit"))
     logger.info(f"Profile loaded: {ds_name} → {df.shape}")
     return df
+
 
 
 def merge_rare_classes(series: pd.Series, min_count: int, other_name: str) -> Tuple[pd.Series, Dict[str, str]]:
@@ -806,18 +840,32 @@ def evaluate_topk_metrics_nbo(predictions, targets, inverse_target_mapping, k_va
 
 def get_config_schema() -> Dict[str, Any]:
     """
-    Schéma minimal pour valider la config. 
-    On contrôle surtout la présence/typage des clés utilisées par le pipeline.
+    Schéma minimal pour valider la config.
+    NOTE: events_dataset OU events_df doivent être fournis (au moins un).
     """
     return {
         "data": {
-            "events_dataset": {"type": str, "required": True},
+            # Au moins l'un des deux :
+            "events_dataset": {"type": (str, type(None)), "required": False},
+            "events_df": {"type": (pd.DataFrame, type(None)), "required": False},
+
+            # Profil en mémoire (optionnel)
+            "profile_df": {"type": (pd.DataFrame, type(None)), "required": False},
+
+            # Requis pour interpréter les données
             "client_id_col": {"type": str, "required": True},
             "event_time_col": {"type": str, "required": True},
             "product_col": {"type": str, "required": True},
-            # optionnels
+
+            # Optionnels
             "dataset_name": {"type": (str, type(None)), "required": False},
+            "sample_size": {"type": int, "required": False},
+            "limit": {"type": (int, type(None)), "required": False},
+            "chunk_size": {"type": int, "required": False},
+            "partitions": {"type": (str, list, type(None)), "required": False},
+            "temporal_split": {"type": (dict, type(None)), "required": False},
             "event_extra_cols": {"type": list, "required": False},
+            "profile_join_key": {"type": (str, type(None)), "required": False},
             "profile_categorical_cols": {"type": list, "required": False},
             "profile_sequence_cols": {"type": list, "required": False},
         },
@@ -833,6 +881,7 @@ def get_config_schema() -> Dict[str, Any]:
             "exclude_target_values": {"type": list, "required": False},
             "merge_rare_threshold": {"type": int, "required": True},
             "other_class_name": {"type": str, "required": True},
+            "target_col": {"type": (str, type(None)), "required": False},
         },
         "model": {
             "d_model": {"type": int, "required": True},
@@ -849,6 +898,8 @@ def get_config_schema() -> Dict[str, Any]:
             "weight_decay": {"type": float, "required": True},
             "val_split": {"type": float, "required": True},
             "class_weighting": {"type": bool, "required": True},
+            "gradient_clip": {"type": (float, type(None)), "required": False},
+            "optimizer": {"type": str, "required": True},
         },
         "outputs": {
             "features_dataset": {"type": (str, type(None)), "required": False},
@@ -863,6 +914,7 @@ def get_config_schema() -> Dict[str, Any]:
             "seed": {"type": (int, type(None)), "required": True},
         },
     }
+
 
 
 def validate_config(config: Dict[str, Any], strict: bool = False) -> List[str]:
@@ -912,9 +964,17 @@ def validate_config(config: Dict[str, Any], strict: bool = False) -> List[str]:
                     "model.max_sequence_length doit être >= sequence.months_lookback"
                 )
 
-    # Blocs data : colonnes doivent être présentes si dataset est fourni
+
     if "data" in config:
         d = config["data"]
+
+        # Au moins l'un des deux : events_df (DataFrame) OU events_dataset (str non vide)
+        has_mem = isinstance(d.get("events_df"), pd.DataFrame) and not d.get("events_df").empty
+        has_ds  = isinstance(d.get("events_dataset"), str) and len(d.get("events_dataset")) > 0
+        if not (has_mem or has_ds):
+            errors.append("data.events_df (DataFrame) ou data.events_dataset (nom de dataset) doit être fourni")
+
+        # Colonnes requises non vides
         for col_key in ["client_id_col", "event_time_col", "product_col"]:
             if not d.get(col_key):
                 errors.append(f"data.{col_key} est requis (non vide)")
