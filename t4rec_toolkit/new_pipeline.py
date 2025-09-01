@@ -119,7 +119,7 @@ def blank_config() -> Dict[str, Any]:
             "sequence_cols": [],           # (rempli automatiquement pour events)
             "categorical_cols": [],        # (profil ou events extra)
             "target_col": "TARGET_PRODUCT",# label final (si pas build auto)
-            "exclude_target_values": ["aucune_souscription"],
+            "exclude_target_values": ["Aucune_Proposition"],
             "merge_rare_threshold": 200,   # <200 exemples → "AUTRES_PRODUITS"
             "other_class_name": "AUTRES_PRODUITS",
         },
@@ -461,7 +461,7 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
         y_series = pd.Series(y_raw).astype(str)
       
         # --- Exclusion des valeurs cibles indésirables (ex: Aucune_Proposition) ---
-        exclude_vals = cfg["features"].get("exclude_target_values", []) if "features" in cfg else []
+        exclude_vals = config["features"].get("exclude_target_values", []) if "features" in config else []
         exclude_vals = [str(x).strip() for x in (exclude_vals or [])]
         
         y_series_norm = y_series.str.strip()
@@ -469,14 +469,10 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
         n_before = len(y_series_norm); n_drop = int((~mask).sum())
         if n_drop > 0:
             logger.info(f"[Target exclusion] {n_drop}/{n_before} lignes exclues (valeurs: {exclude_vals})")
-            # filtre cible
             y_series = y_series[mask]
-            # filtre séquences
             for k in list(seq_pack["X_seq"].keys()):
                 seq_pack["X_seq"][k] = seq_pack["X_seq"][k][mask.values]
-            # filtre client_ids
             seq_pack["client_ids"] = np.asarray(seq_pack["client_ids"])[mask.values]
-            # filtre features profil déjà construites (si c'est avant ce bloc, sinon no-op)
             if 'X_cat' in locals():
                 for k in list(X_cat.keys()):
                     X_cat[k] = X_cat[k][mask.values]
@@ -485,6 +481,7 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
                     X_seq_extra[k] = X_seq_extra[k][mask.values]
         else:
             logger.info("[Target exclusion] aucune ligne exclue")
+
 
       
     else:
