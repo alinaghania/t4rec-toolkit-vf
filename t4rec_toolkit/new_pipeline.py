@@ -168,58 +168,43 @@ def _setup_logging(verbose: bool) -> None:
 
 def _load_events_df(cfg: Dict[str, Any]) -> pd.DataFrame:
     """
-    Charge les événements :
-      1) si cfg["data"]["events_df"] (DataFrame en mémoire) est fourni → priorité
-      2) sinon lit le dataset Dataiku cfg["data"]["events_dataset"]
-
-    Colonnes requises : client_id_col, event_time_col, product_col.
+    Charge le dataset d'événements depuis :
+      - cfg['data']['events_df'] (DataFrame en mémoire) si fourni
+      - sinon un dataset Dataiku (cfg['data']['events_dataset'])
     """
     logger = logging.getLogger(__name__)
     dcfg = cfg["data"]
 
-    # ---- 1) Mode mémoire (prioritaire) ----
+    # 1) Chemin "no-IO" : DataFrame déjà construit en mémoire
     if dcfg.get("events_df") is not None:
         df = dcfg["events_df"]
-        if not isinstance(df, pd.DataFrame) or df.empty:
-            raise ValueError("data.events_df fourni mais vide ou non-DataFrame.")
+        if not isinstance(df, pd.DataFrame):
+            raise ValueError("data.events_df doit être un pandas.DataFrame")
+        logger.info(f"Events (in-memory) loaded: shape={df.shape}")
+    else:
+        # 2) Chemin Dataiku classique
+        if not _HAS_DATAIKU:
+            raise RuntimeError("Dataiku requis pour charger events_dataset.")
+        ds_name = dcfg.get("events_dataset")
+        if not ds_name:
+            raise ValueError("data.events_dataset est requis (séquences temporelles).")
+        ds = dataiku.Dataset(ds_name)
+        df = ds.get_dataframe(limit=dcfg.get("limit"))
+        logger.info(f"Events loaded: {ds_name} → {df.shape}")
 
-        cid = dcfg["client_id_col"]
-        tcol = dcfg["event_time_col"]
-        pcol = dcfg["product_col"]
-        missing = [c for c in (cid, tcol, pcol) if c not in df.columns]
-        if missing:
-            raise ValueError(f"Colonnes manquantes dans events_df: {missing}")
-
-        # normalisation datetime (tz-naive)
-        df = df.copy()
-        dt = pd.to_datetime(df[tcol], errors="coerce", utc=True)
-        df[tcol] = dt.dt.tz_convert(None)
-        df = df.dropna(subset=[tcol])
-        logger.info(f"[events_df] (in-memory) → {df.shape}")
-        return df
-
-    # ---- 2) Mode Dataiku (fallback) ----
-    if not _HAS_DATAIKU:
-        raise RuntimeError("Dataiku requis pour lire data.events_dataset (ou bien passer data.events_df).")
-
-    ds_name = dcfg.get("events_dataset") or ""
-    if not ds_name:
-        raise ValueError("data.events_dataset est requis si data.events_df n'est pas fourni.")
-
-    ds = dataiku.Dataset(ds_name)
-    df = ds.get_dataframe(limit=dcfg.get("limit"))
-    logger.info(f"Events loaded: {ds_name} → {df.shape}")
-
+    # Renommer/valider colonnes
     cid = dcfg["client_id_col"]
     tcol = dcfg["event_time_col"]
     pcol = dcfg["product_col"]
-    missing = [c for c in (cid, tcol, pcol) if c not in df.columns]
-    if missing:
-        raise ValueError(f"Colonnes manquantes dans events: {missing}")
+    for c in (cid, tcol, pcol):
+        if c not in df.columns:
+            raise ValueError(f"Colonne manquante dans events: '{c}'")
 
+    # Date en datetime
     df[tcol] = pd.to_datetime(df[tcol], errors="coerce")
     df = df.dropna(subset=[tcol])
     return df
+
 
 
 
@@ -474,6 +459,34 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
     if config["sequence"]["build_target_from_events"]:
         y_raw = seq_pack["y"]  # items (str ou id) à T+h
         y_series = pd.Series(y_raw).astype(str)
+      
+        # --- Exclusion des valeurs cibles indésirables (ex: Aucune_Proposition) ---
+        exclude_vals = cfg["features"].get("exclude_target_values", []) if "features" in cfg else []
+        exclude_vals = [str(x).strip() for x in (exclude_vals or [])]
+        
+        y_series_norm = y_series.str.strip()
+        mask = ~y_series_norm.isin(exclude_vals)
+        n_before = len(y_series_norm); n_drop = int((~mask).sum())
+        if n_drop > 0:
+            logger.info(f"[Target exclusion] {n_drop}/{n_before} lignes exclues (valeurs: {exclude_vals})")
+            # filtre cible
+            y_series = y_series[mask]
+            # filtre séquences
+            for k in list(seq_pack["X_seq"].keys()):
+                seq_pack["X_seq"][k] = seq_pack["X_seq"][k][mask.values]
+            # filtre client_ids
+            seq_pack["client_ids"] = np.asarray(seq_pack["client_ids"])[mask.values]
+            # filtre features profil déjà construites (si c'est avant ce bloc, sinon no-op)
+            if 'X_cat' in locals():
+                for k in list(X_cat.keys()):
+                    X_cat[k] = X_cat[k][mask.values]
+            if 'X_seq_extra' in locals():
+                for k in list(X_seq_extra.keys()):
+                    X_seq_extra[k] = X_seq_extra[k][mask.values]
+        else:
+            logger.info("[Target exclusion] aucune ligne exclue")
+
+      
     else:
         # Alternative : target fournie dans une table (moins recommandé ici)
         raise ValueError("Pour la version temporelle, utilisez build_target_from_events=True.")
