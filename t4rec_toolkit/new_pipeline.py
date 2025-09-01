@@ -378,27 +378,30 @@ def _build_t4rec_embedding_module(
 
 def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Pipeline complet :
+    Pipeline complet (RAM/VRAM friendly) :
       - construction des séquences temporelles (SequenceBuilder),
       - encodage des features (cat/seq),
       - embeddings T4Rec + Transformer,
-      - training/validation (mini-batches, AMP),
+      - training/validation en MINI-BATCHES,
       - métriques + sauvegardes.
     """
+    import gc
+    from torch.cuda.amp import autocast, GradScaler
+
     t0 = time.time()
     _setup_logging(config["runtime"]["verbose"])
     logger = logging.getLogger(__name__)
+
+    # Device + AMP
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    use_amp = (device.type == "cuda")
+    scaler = GradScaler(enabled=use_amp)
 
     # Seeds
     seed = config["runtime"].get("seed")
     if seed is not None:
         np.random.seed(seed)
         torch.manual_seed(seed)
-
-    # ---- Device & AMP ----
-    use_amp = torch.cuda.is_available()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    scaler = torch.cuda.amp.GradScaler() if use_amp else None
 
     # 1) Charger données
     events_df = _load_events_df(config)
@@ -419,14 +422,11 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
     )
     builder = SequenceBuilder(sb_cfg)
     seq_pack = builder.fit_transform(events_df)
-    logger.info(
-        f"[SequenceBuilder] X_seq keys={list(seq_pack['X_seq'].keys())}, "
-        f"shape={next(iter(seq_pack['X_seq'].values())).shape}"
-    )
+    logger.info(f"[SequenceBuilder] X_seq keys={list(seq_pack['X_seq'].keys())}, shape={next(iter(seq_pack['X_seq'].values())).shape}")
 
-    # 3) Créer/ajouter features profil (facultatif)
-    X_cat: Dict[str, np.ndarray] = {}
-    X_seq_extra: Dict[str, np.ndarray] = {}
+    # 3) Features profil (facultatif)
+    X_cat = {}
+    X_seq_extra = {}
     if profile_df is not None:
         pid = config["data"]["profile_join_key"]
         prof = profile_df.set_index(pid).reindex(seq_pack["client_ids"]).reset_index()
@@ -441,7 +441,7 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
             for k, arr in cat_res.data.items():
                 X_cat[k.replace("_encoded", "")] = arr.astype(np.int64)
 
-        # "Seq" mono-pas (ex: âge) → indices discrets
+        # Séquentielles "mono-pas" → discrétisation simple
         seq_cols = config["data"].get("profile_sequence_cols", [])
         if len(seq_cols) > 0:
             seq_tr = SequenceTransformer(name="ProfileSeq")
@@ -452,20 +452,16 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
                 arr01 = np.clip(arr, 0.0, 1.0)
                 X_seq_extra[k.replace("_seq", "")] = (arr01 * (vocab_p - 1)).astype(np.int64)
 
-    # 4) Cible (y) + exclusion valeurs indésirables
+    # 4) Cible (y) + exclusion explicite
     if config["sequence"]["build_target_from_events"]:
-        y_raw = seq_pack["y"]
-        y_series = pd.Series(y_raw).astype(str)
-
-        exclude_vals = config["features"].get("exclude_target_values", []) if "features" in config else []
+        y_series = pd.Series(seq_pack["y"]).astype(str)
+        exclude_vals = config.get("features", {}).get("exclude_target_values", [])
         exclude_vals = [str(x).strip() for x in (exclude_vals or [])]
-
         y_series_norm = y_series.str.strip()
         mask = ~y_series_norm.isin(exclude_vals)
-        n_before = len(y_series_norm)
         n_drop = int((~mask).sum())
         if n_drop > 0:
-            logger.info(f"[Target exclusion] {n_drop}/{n_before} lignes exclues (valeurs: {exclude_vals})")
+            logger.info(f"[Target exclusion] {n_drop}/{len(mask)} lignes exclues (valeurs: {exclude_vals})")
             y_series = y_series[mask]
             for k in list(seq_pack["X_seq"].keys()):
                 seq_pack["X_seq"][k] = seq_pack["X_seq"][k][mask.values]
@@ -485,35 +481,32 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
     min_count = config["features"]["merge_rare_threshold"]
     other_name = config["features"]["other_class_name"]
     y_merged, rare_map = merge_rare_classes(y_series, min_count=min_count, other_name=other_name)
+
     if len(rare_map) > 0:
         tops = list(rare_map.keys())[:20]
-        logger.info(f"=== Regroupement classes rares → '{other_name}' ===")
-        logger.info(f"  {len(rare_map)} classes fusionnées. Exemples: {tops} → {other_name}")
+        logger.info(f"=== Classes rares fusionnées → '{other_name}' ({len(rare_map)}). Ex: {tops}")
     else:
-        logger.info("Aucune classe fusionnée (pas de classe < seuil).")
+        logger.info("Aucune classe fusionnée.")
 
     # 6) Encodage cible
     encoder = LabelEncoder()
     y = encoder.fit_transform(y_merged.values)
     n_classes = len(encoder.classes_)
-    logger.info(f"Cible: {n_classes} classes après fusion éventuelle.")
+    logger.info(f"Cible: {n_classes} classes.")
 
-    # 7) Préparer features séquentielles ( → tenseurs)
-    X_seq_dict: Dict[str, torch.Tensor] = {}
+    # 7) Tenseurs features (CPU) — on ne pousse que les mini-batches sur GPU
+    X_seq_dict = {}
+    T_len = next(iter(seq_pack["X_seq"].values())).shape[1]
     for feat, mat in seq_pack["X_seq"].items():
-        X_seq_dict[feat] = torch.tensor(mat, dtype=torch.long)
+        X_seq_dict[feat] = torch.tensor(mat, dtype=torch.long)  # reste sur CPU
 
-    # Profils répétés sur T
-    if X_seq_extra:
-        T_len = X_seq_dict[list(X_seq_dict.keys())[0]].shape[1]
-        for feat, vec in X_seq_extra.items():
-            repeated = np.repeat(vec[:, None], repeats=T_len, axis=1)
-            X_seq_dict[feat] = torch.tensor(repeated, dtype=torch.long)
-    if X_cat:
-        T_len = X_seq_dict[list(X_seq_dict.keys())[0]].shape[1]
-        for feat, vec in X_cat.items():
-            repeated = np.repeat(vec[:, None], repeats=T_len, axis=1)
-            X_seq_dict[feat] = torch.tensor(repeated.astype(np.int64), dtype=torch.long)
+    for feat, vec in X_seq_extra.items():
+        repeated = np.repeat(vec[:, None], repeats=T_len, axis=1)
+        X_seq_dict[feat] = torch.tensor(repeated, dtype=torch.long)
+
+    for feat, vec in X_cat.items():
+        repeated = np.repeat(vec[:, None], repeats=T_len, axis=1)
+        X_seq_dict[feat] = torch.tensor(repeated.astype(np.int64), dtype=torch.long)
 
     # 8) Vocab sizes
     vocab_sizes = dict(seq_pack["vocab_sizes"])
@@ -523,21 +516,22 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
         vmax = int(np.max(X_cat[feat])) if len(X_cat[feat]) > 0 else 1
         vocab_sizes[feat] = max(vmax + 1, 10)
 
-    # 9) Split train/val (shuffle clients)
+    # 9) Split train/val (aléatoire client-level)
     N = len(y)
-    idx = np.arange(N); np.random.shuffle(idx)
+    idx = np.arange(N)
+    np.random.shuffle(idx)
     split = int(N * (1.0 - config["training"]["val_split"]))
     tr_idx, va_idx = idx[:split], idx[split:]
 
-    def take_idx(d: Dict[str, torch.Tensor], ids: np.ndarray) -> Dict[str, torch.Tensor]:
+    def slice_dict(d: Dict[str, torch.Tensor], ids: np.ndarray) -> Dict[str, torch.Tensor]:
         return {k: v[ids] for k, v in d.items()}
 
-    Xtr = take_idx(X_seq_dict, tr_idx)
-    Xva = take_idx(X_seq_dict, va_idx)
-    ytr = torch.tensor(y[tr_idx], dtype=torch.long)
-    yva = torch.tensor(y[va_idx], dtype=torch.long)
+    Xtr_cpu = slice_dict(X_seq_dict, tr_idx)
+    Xva_cpu = slice_dict(X_seq_dict, va_idx)
+    ytr_cpu = torch.tensor(y[tr_idx], dtype=torch.long)
+    yva_cpu = torch.tensor(y[va_idx], dtype=torch.long)
 
-    # 10) Embeddings T4Rec
+    # 10) Module d'embeddings T4Rec
     d_model = config["model"]["d_model"]
     max_T = config["model"]["max_sequence_length"]
     emb_mod, concat_dim = _build_t4rec_embedding_module(
@@ -557,31 +551,17 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
         max_seq_len=max_T,
         proj_in_dim=concat_dim,
     ).to(device)
-
-    # Move datasets to device once
-    Xtr = {k: v.to(device) for k, v in Xtr.items()}
-    Xva = {k: v.to(device) for k, v in Xva.items()}
-    ytr = ytr.to(device)
-    yva = yva.to(device)
-
     logger.info(f"Model params: {sum(p.numel() for p in model.parameters()):,}")
 
     # 12) Optim / Loss
-    if config["training"]["optimizer"].lower() == "adamw":
-        optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=config["training"]["learning_rate"],
-            weight_decay=config["training"]["weight_decay"],
-        )
-    else:
-        optimizer = torch.optim.Adam(
-            model.parameters(),
-            lr=config["training"]["learning_rate"],
-            weight_decay=config["training"]["weight_decay"],
-        )
+    optimizer = (torch.optim.AdamW if config["training"]["optimizer"].lower() == "adamw" else torch.optim.Adam)(
+        model.parameters(),
+        lr=config["training"]["learning_rate"],
+        weight_decay=config["training"]["weight_decay"],
+    )
 
     if config["training"]["class_weighting"]:
-        counts = np.bincount(ytr.detach().cpu().numpy(), minlength=n_classes).astype(np.float32)
+        counts = np.bincount(ytr_cpu.numpy(), minlength=n_classes).astype(np.float32)
         inv = 1.0 / np.clip(counts, 1.0, None)
         weights = inv / inv.sum() * n_classes
         class_w = torch.tensor(weights, dtype=torch.float32, device=device)
@@ -589,99 +569,87 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
     else:
         loss_fn = nn.CrossEntropyLoss()
 
-    # 13) Training loop (mini-batches + AMP)
-    num_epochs = config["training"]["num_epochs"]
-    bs = config["training"]["batch_size"]
+    # 13) Data iterator
+    bs = int(config["training"]["batch_size"])
+    bs_eval = max(1, min(bs, 256))  # batch val (petit pour éviter OOM)
     grad_clip = config["training"].get("gradient_clip", None)
 
-    def iterate_batches(X: Dict[str, torch.Tensor], y: torch.Tensor, batch_size: int):
-        Nloc = len(y)
+    def batches(Xcpu: Dict[str, torch.Tensor], ycpu: torch.Tensor, batch_size: int):
+        Nloc = len(ycpu)
         for s in range(0, Nloc, batch_size):
             e = min(s + batch_size, Nloc)
-            yield {k: v[s:e] for k, v in X.items()}, y[s:e]
+            xb = {k: v[s:e].to(device, non_blocking=False) for k, v in Xcpu.items()}
+            yb = ycpu[s:e].to(device, non_blocking=False)
+            yield xb, yb
 
+    # 14) Training loop (mini-batches + AMP)
+    num_epochs = config["training"]["num_epochs"]
     pbar = tqdm(range(num_epochs), desc="Training") if (_HAS_TQDM and config["runtime"]["progress"]) else range(num_epochs)
     history = []
 
     for epoch in pbar:
         model.train()
         tr_loss = 0.0; n_steps = 0
-        for xb, yb in iterate_batches(Xtr, ytr, bs):
+        for xb, yb in batches(Xtr_cpu, ytr_cpu, bs):
             optimizer.zero_grad(set_to_none=True)
-            if use_amp:
-                with torch.cuda.amp.autocast():
-                    logits = model(xb)
-                    loss = loss_fn(logits, yb)
-                scaler.scale(loss).backward()
-                if grad_clip:
-                    scaler.unscale_(optimizer)
-                    nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-                scaler.step(optimizer)
-                scaler.update()
-            else:
+            with autocast(enabled=use_amp):
                 logits = model(xb)
                 loss = loss_fn(logits, yb)
-                loss.backward()
-                if grad_clip:
-                    nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-                optimizer.step()
-            tr_loss += loss.item(); n_steps += 1
+            scaler.scale(loss).backward()
+            if grad_clip:
+                scaler.unscale_(optimizer)
+                nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+            tr_loss += float(loss.item()); n_steps += 1
+
         tr_loss /= max(1, n_steps)
 
-        # Validation (mini-batches)
+        # Validation (mini-batches + pas d'allocation géante)
         model.eval()
-        val_losses = []; correct = 0; total = 0
+        va_loss, n_va, correct = 0.0, 0, 0
         with torch.no_grad():
-            for xb, yb in iterate_batches(Xva, yva, bs):
-                if use_amp:
-                    with torch.cuda.amp.autocast():
-                        logits_b = model(xb)
-                        loss_b = loss_fn(logits_b, yb)
-                else:
-                    logits_b = model(xb)
-                    loss_b = loss_fn(logits_b, yb)
-                val_losses.append(loss_b.item())
-                pred_b = torch.argmax(logits_b, dim=1)
-                correct += (pred_b == yb).sum().item()
-                total   += len(yb)
-        va_loss = float(np.mean(val_losses)) if val_losses else 0.0
-        acc     = correct / max(total, 1)
+            for xb, yb in batches(Xva_cpu, yva_cpu, bs_eval):
+                with autocast(enabled=use_amp):
+                    logits = model(xb)
+                    loss = loss_fn(logits, yb)
+                va_loss += float(loss.item()) * yb.size(0)
+                preds = torch.argmax(logits, dim=1)
+                correct += int((preds == yb).sum().item())
+                n_va += yb.size(0)
+        va_loss /= max(1, n_va)
+        acc = correct / max(1, n_va)
 
         history.append({"epoch": epoch + 1, "train_loss": tr_loss, "val_loss": va_loss, "val_accuracy": acc})
         if _HAS_TQDM and config["runtime"]["progress"]:
             pbar.set_postfix({"loss": f"{tr_loss:.4f}", "val_acc": f"{acc:.4f}"})
         logger.info(f"Epoch {epoch+1}/{num_epochs} | loss={tr_loss:.4f} | val_loss={va_loss:.4f} | val_acc={acc:.4f}")
 
-    # 14) Final metrics (mini-batches)
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        gc.collect()
+
+    # 15) Final metrics (mini-batches)
     model.eval()
-    logits_list = []; yva_list = []; preds_list = []
+    all_logits = []
+    all_preds  = []
     with torch.no_grad():
-        for xb, yb in iterate_batches(Xva, yva, bs):
-            if use_amp:
-                with torch.cuda.amp.autocast():
-                    logits_b = model(xb)
-            else:
-                logits_b = model(xb)
-            logits_list.append(logits_b)
-            yva_list.append(yb)
-            preds_list.append(torch.argmax(logits_b, dim=1))
+        for xb, yb in batches(Xva_cpu, yva_cpu, bs_eval):
+            with autocast(enabled=use_amp):
+                logits = model(xb)
+            all_logits.append(logits.detach().cpu())
+            all_preds.append(torch.argmax(logits, dim=1).detach().cpu())
 
-    logits = torch.cat(logits_list, dim=0)
-    yva_all = torch.cat(yva_list, dim=0)
-    preds = torch.cat(preds_list, dim=0)
-
-    acc = (preds == yva_all).float().mean().item()
-
-    # CPU numpy pour sklearn
-    yva_cpu = yva_all.detach().cpu().numpy()
-    preds_cpu = preds.detach().cpu().numpy()
+    logits_cat = torch.cat(all_logits, dim=0)
+    preds_cat  = torch.cat(all_preds,  dim=0)
+    acc = (preds_cat.numpy() == yva_cpu.numpy()).mean().item() if hasattr(np, "mean") else float((preds_cat == yva_cpu).float().mean().item())
     precision, recall, f1, _ = precision_recall_fscore_support(
-        yva_cpu, preds_cpu, average="weighted", zero_division=0
+        yva_cpu.numpy(), preds_cat.numpy(), average="weighted", zero_division=0
     )
 
-    # 15) Top-K (format collègue)
-    prediction_scores = logits.detach().cpu().numpy()
-    true_labels = yva_all.detach().cpu().numpy()
+    # 16) Top-K (utilise logits en CPU déjà batchés)
+    prediction_scores = logits_cat.numpy()
+    true_labels = yva_cpu.numpy()
     inverse_target_mapping = {i: cls for i, cls in enumerate(encoder.classes_)}
     topk_metrics, _ignored = evaluate_topk_metrics_nbo(
         predictions=prediction_scores,
@@ -690,17 +658,18 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
         k_values=[1, 3, 5, 10],
     )
 
-    # 16) Sauvegardes Dataiku (best effort)
+    # 17) Sauvegardes Dataiku (best effort)
     saved = {}
     if _HAS_DATAIKU:
         try:
-            # PREDICTIONS (client, top1..top5)
             topk = 5
             pred_list = []
+            # Pour récupérer l’alignement client_id sur la validation
+            va_client_ids = np.asarray(seq_pack["client_ids"])[va_idx]
             for i, (score, ytrue) in enumerate(zip(prediction_scores, true_labels)):
                 top_idx = np.argsort(score)[-topk:][::-1]
                 row = {
-                    "client_id": int(seq_pack["client_ids"][va_idx[i]]),
+                    "client_id": int(va_client_ids[i]),
                     "true_label": str(inverse_target_mapping.get(int(ytrue), "UNK")),
                     "pred_top1": str(inverse_target_mapping.get(int(top_idx[0]), "UNK")),
                     "pred_top1_score": float(score[top_idx[0]]),
@@ -711,14 +680,12 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
                     row[f"pred_top{k+1}_score"] = float(score[ki])
                 pred_list.append(row)
 
-            pred_df = pd.DataFrame(pred_list)
             if config["outputs"].get("predictions_dataset"):
+                pred_df = pd.DataFrame(pred_list)
                 dataiku.Dataset(config["outputs"]["predictions_dataset"]).write_with_schema(pred_df)
                 saved["predictions"] = config["outputs"]["predictions_dataset"]
 
-            # METRICS
-            metrics_rows = []
-            metrics_rows += [
+            metrics_rows = [
                 {"metric_name": "accuracy", "metric_value": float(acc), "metric_type": "standard", "dataset_split": "validation"},
                 {"metric_name": "precision", "metric_value": float(precision), "metric_type": "standard", "dataset_split": "validation"},
                 {"metric_name": "recall", "metric_value": float(recall), "metric_type": "standard", "dataset_split": "validation"},
@@ -735,12 +702,11 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
                     {"metric_name": "Coverage@K", "metric_value": float(d.get("Coverage@K", 0.0)), "metric_type": "topk_nbo", "dataset_split": "validation", "k_value": k},
                     {"metric_name": "Clients_evaluated", "metric_value": float(d.get("Clients_evaluated", 0.0)), "metric_type": "topk_nbo", "dataset_split": "validation", "k_value": k},
                 ]
-            met_df = pd.DataFrame(metrics_rows)
             if config["outputs"].get("metrics_dataset"):
+                met_df = pd.DataFrame(metrics_rows)
                 dataiku.Dataset(config["outputs"]["metrics_dataset"]).write_with_schema(met_df)
                 saved["metrics"] = config["outputs"]["metrics_dataset"]
 
-            # ARTIFACTS
             artifacts = pd.DataFrame({
                 "artifact_name": ["model_config", "sequence_builder_config", "rare_class_mapping_json"],
                 "artifact_value": [
@@ -753,16 +719,15 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
             if config["outputs"].get("model_artifacts_dataset"):
                 dataiku.Dataset(config["outputs"]["model_artifacts_dataset"]).write_with_schema(artifacts)
                 saved["model_artifacts"] = config["outputs"]["model_artifacts_dataset"]
-
         except Exception as e:
             logger.warning(f"Sauvegarde Dataiku échouée (non bloquant): {e}")
 
-    # 17) Retour
+    # 18) Retour
     out = {
-        "metrics": {"accuracy": acc, "precision": precision, "recall": recall, "f1": f1},
+        "metrics": {"accuracy": float(acc), "precision": float(precision), "recall": float(recall), "f1": float(f1)},
         "predictions": {
             "raw_outputs": prediction_scores,
-            "predicted_classes": preds.detach().cpu().numpy(),
+            "predicted_classes": preds_cat.numpy(),
             "true_classes": true_labels,
         },
         "model_info": {
@@ -771,7 +736,7 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
         },
         "data_info": {
             "n_clients": int(len(y)),
-            "seq_len": int(next(iter(X_seq_dict.values())).shape[1]),
+            "seq_len": int(T_len),
             "features": list(X_seq_dict.keys()),
             "n_classes": int(n_classes),
         },
@@ -779,6 +744,7 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
         "saved_datasets": saved,
     }
     return out
+
 
 
 
