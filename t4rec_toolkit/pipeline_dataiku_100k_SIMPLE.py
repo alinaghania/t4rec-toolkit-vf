@@ -122,99 +122,171 @@ print(df_events.head(10))
 # - Taille <= LIMIT_ROWS
 # - Prêt à être ingéré par votre SequenceBuilder / pipeline_core.run_training
 
-
 # ===============================================================
-# 2) FS (profil) => SAVE EVENTS => CONFIG => TRAIN => METRICS
+# 2) FS (profil) => SAVE EVENTS => CONFIG => TRAIN => METRICS (LOGGÉ À FOND)
 # ===============================================================
 
-import dataiku
+import os, sys, time, logging
 from datetime import datetime
+import traceback
 import pandas as pd
+import numpy as np
+import dataiku
+
+# -- Console non-bufferisée pour voir les prints en live
+os.environ["PYTHONUNBUFFERED"] = "1"
+
+# -- Logger root au niveau INFO
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+logger = logging.getLogger(__name__)
+
+def log(msg):
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"{ts} | {msg}", flush=True)
+    logger.info(msg)
+
+start_all = time.time()
+log("=== DRIVER START ===")
 
 # --- Toolkit (ta lib) ---
 from t4rec_toolkit.utils import FeatureSelector, FeatureSelectorConfig
 from t4rec_toolkit.pipeline_core import (
     blank_config,
     run_training,
-    evaluate_topk_metrics_nbo,   # déjà importé dans pipeline_core, ici pour affichage si besoin
+    evaluate_topk_metrics_nbo,   # pour fallback d'affichage Top-K
 )
 
 # ------------ PARAMS ------------
-DATASET_MAIN = "BASE_SCORE_COMPLETE_prepared"   # table profil (la même que tout à l’heure)
-EVENTS_TMP   = "TMP_T4REC_EVENTS_RAM"          # dataset temporaire pour les événements
+DATASET_MAIN  = "BASE_SCORE_COMPLETE_prepared"   # table profil
+EVENTS_TMP    = "df_event"                       # dataset Dataiku pour events
 CLIENT_ID_COL = "NUMTECPRS"
 TIME_COL      = "DATMAJ"
 PRODUCT_COL   = "SOUSCRIPTION_PRODUIT_1M"
 
-# Candidats profil (fallback si FS indispo / vide)
+# Profil (fallback si FS indispo / vide)
 PROFILE_CATEGORICAL_CANDIDATES = ["MEILLEURE_CARTE_DETENUE_M", "LIBFAMCSP", "CONNAISSANCE_MIF"]
 PROFILE_SEQUENCE_CANDIDATES    = ["AGE"]
 
-# Cible: exclure la “non-souscription”
+# Cible
 TARGET_EXCLUDE = ["aucune_souscription"]
 
-# Fenêtre temporelle (longueur de séquence)
+# Fenêtre temporelle
 MONTHS_LOOKBACK = 24
 
-# Taille modèle & entraînement (anti-OOM friendly)
-D_MODEL  = 512      # ↓ si OOM : 384 ou 256
-N_HEADS  = 8        # ↓ si OOM : 4
-N_LAYERS = 4        # ↓ si OOM : 2–3
-BATCH_SIZE = 64     # ↓ si OOM : 32 ou 16
-EPOCHS     = 10     # ↑ plus tard si OK
+# Modèle & entraînement (paramètres anti-OOM)
+D_MODEL    = 256    # 256/384/768 selon RAM
+N_HEADS    = 4      # 4/8/16/24
+N_LAYERS   = 2      # 2..8
+BATCH_SIZE = 16     # 16/32/64
+EPOCHS     = 10     # augmenter ensuite
 LEARNING_RATE = 5e-4
-VAL_SPLIT     = 0.2
+VAL_SPLIT     = 0.20
 
-print("\n== STEP A: FS (profil) ==", datetime.now())
+# --------------------------------------------------------------
+# Sanity check df_events
+# --------------------------------------------------------------
+log("== STEP 0: CHECK df_events en mémoire ==")
+t0 = time.time()
+
+if "df_events" not in globals():
+    raise RuntimeError("df_events manquant : exécute d'abord la cellule de construction des événements.")
+
+assert isinstance(df_events, pd.DataFrame), "df_events doit être un DataFrame pandas"
+need_cols = [CLIENT_ID_COL, TIME_COL, PRODUCT_COL]
+missing = [c for c in need_cols if c not in df_events.columns]
+if missing:
+    raise ValueError(f"df_events ne contient pas les colonnes requises: {missing}")
+
+log(f"df_events shape: {df_events.shape}")
+log(f"df_events dtypes:\n{df_events.dtypes}")
+
+# aperçu léger
+log("Aperçu df_events.head():")
+print(df_events.head(5), flush=True)
+
+# stats rapide
+try:
+    n_clients = df_events[CLIENT_ID_COL].nunique()
+    n_rows = len(df_events)
+    n_months = df_events[TIME_COL].dt.to_period("M").nunique() if np.issubdtype(df_events[TIME_COL].dtype, np.datetime64) else "NA"
+    log(f"Stats rapides — rows={n_rows:,} | clients uniques={n_clients:,} | mois distincts={n_months}")
+except Exception as e:
+    log(f"Stats rapides impossibles (non bloquant): {e}")
+
+# check target exclude
+try:
+    vc = df_events[PRODUCT_COL].astype(str).value_counts(dropna=False)
+    log(f"TOP valeurs de la cible (head 10):\n{vc.head(10)}")
+    excl_present = [x for x in TARGET_EXCLUDE if x in vc.index]
+    log(f"Présence des valeurs à exclure dans df_events: {excl_present}")
+except Exception as e:
+    log(f"Value counts cible impossible (non bloquant): {e}")
+
+log(f"STEP 0 DONE in {time.time()-t0:.1f}s")
+
+# --------------------------------------------------------------
+# FS (profil)
+# --------------------------------------------------------------
+log("== STEP A: FS (profil) ==")
+t0 = time.time()
 seq_cols_fs, cat_cols_fs = [], []
 try:
     fs_cfg = FeatureSelectorConfig(
-        sample_size=50_000,            # rapide
-        total_feature_cap=20,
-        top_k_sequence=10,             # numériques profil
-        top_k_categorical=8,           # catégorielles profil
-        compute_model_importance=True,
-        rf_n_estimators=100,
-        corr_threshold=0.85,
-        chunk_size=20_000,
-        downcast_dtypes=True,
-        correlation_batch_size=100,
-        gc_frequency=50,
-        report_dataset=None,
-        verbose=True, progress=True,
+        sample_size=50_000, total_feature_cap=20,
+        top_k_sequence=10, top_k_categorical=8,
+        compute_model_importance=True, rf_n_estimators=100,
+        corr_threshold=0.85, chunk_size=20_000,
+        downcast_dtypes=True, correlation_batch_size=100,
+        gc_frequency=50, report_dataset=None, verbose=True, progress=True,
     )
     fs = FeatureSelector(fs_cfg)
-    fs.fit(DATASET_MAIN, None, PRODUCT_COL)         # table + target
+    log("FS: .fit() sur DATASET_MAIN...")
+    fs.fit(DATASET_MAIN, None, PRODUCT_COL)
     selected = fs.get_selected_features()
     seq_cols_fs = selected.get("sequence_cols", [])
     cat_cols_fs = selected.get("categorical_cols", [])
-    print("FS OK.")
+    log(f"FS OK. seq_cols_fs={seq_cols_fs} | cat_cols_fs={cat_cols_fs}")
 except Exception as e:
-    print(f"FS facultative – on continue sans: {e}")
+    log(f"FS facultative – on continue sans: {e}\n{traceback.format_exc()}")
 
-# Si la FS n’a rien rendu, on garde les colonnes “sûres”
+# fallback si FS vide
 profile_categorical_cols = [c for c in PROFILE_CATEGORICAL_CANDIDATES if (not cat_cols_fs) or (c in cat_cols_fs)]
 profile_sequence_cols    = [c for c in PROFILE_SEQUENCE_CANDIDATES    if (not seq_cols_fs) or (c in seq_cols_fs)]
-
-print("Profil retenu — cat:", profile_categorical_cols)
-print("Profil retenu — num:", profile_sequence_cols)
+log(f"Profil retenu — cat: {profile_categorical_cols}")
+log(f"Profil retenu — num: {profile_sequence_cols}")
+log(f"STEP A DONE in {time.time()-t0:.1f}s")
 
 # --------------------------------------------------------------
-print("\n== STEP B: SAVE df_events -> Dataiku dataset ==", datetime.now())
-# df_events vient du bloc précédent
-assert isinstance(df_events, pd.DataFrame) and not df_events.empty, "df_events est vide ou absent"
-# On force l’ordre des colonnes utiles (si extras présents, on les garde dans la fin)
+# SAVE df_events -> Dataiku dataset
+# --------------------------------------------------------------
+log("== STEP B: SAVE df_events -> Dataiku dataset ==")
+t0 = time.time()
+
+# force l'ordre core (client, date, produit)
 base_cols = [CLIENT_ID_COL, TIME_COL, PRODUCT_COL]
 extras = [c for c in df_events.columns if c not in base_cols]
 df_events = df_events[base_cols + extras]
 
-# Ecriture/écrasement avec schéma
-dataiku.Dataset(EVENTS_TMP).write_with_schema(df_events)
-print(f"Saved events -> {EVENTS_TMP} : {df_events.shape}")
+try:
+    # Si le dataset n'existe pas dans le Flow, crée-le d'abord dans l'UI (tu l'as déjà fait).
+    out_ds = dataiku.Dataset(EVENTS_TMP)
+    out_ds.write_with_schema(df_events)
+    log(f"Saved events -> {EVENTS_TMP} : {df_events.shape}")
+except Exception as e:
+    log(f"Écriture {EVENTS_TMP} échouée: {e}\n{traceback.format_exc()}")
+    raise
+
+log(f"STEP B DONE in {time.time()-t0:.1f}s")
 
 # --------------------------------------------------------------
-print("\n== STEP C: CONFIG ==", datetime.now())
-
+# CONFIG
+# --------------------------------------------------------------
+log("== STEP C: CONFIG ==")
+t0 = time.time()
 config = blank_config()
 
 # Données (événements obligatoires)
@@ -222,7 +294,7 @@ config["data"]["events_dataset"]   = EVENTS_TMP
 config["data"]["client_id_col"]    = CLIENT_ID_COL
 config["data"]["event_time_col"]   = TIME_COL
 config["data"]["product_col"]      = PRODUCT_COL
-config["data"]["event_extra_cols"] = []  # si tu as des extras dans df_events (ex: canal), liste-les ici
+config["data"]["event_extra_cols"] = []  # ex: ["CANAL"]
 
 # Données (profil facultatif)
 config["data"]["dataset_name"]                 = DATASET_MAIN
@@ -261,7 +333,7 @@ config["training"]["class_weighting"] = True
 config["training"]["gradient_clip"]   = 1.0
 config["training"]["optimizer"]       = "adamw"
 
-# Sorties (mets None si tu ne veux rien écrire)
+# Sorties
 config["outputs"]["features_dataset"]        = "T4REC_FEATURES"
 config["outputs"]["predictions_dataset"]     = "T4REC_PREDICTIONS"
 config["outputs"]["metrics_dataset"]         = "T4REC_METRICS"
@@ -273,52 +345,70 @@ config["runtime"]["verbose"]  = True
 config["runtime"]["progress"] = True
 config["runtime"]["seed"]     = 42
 
-print(f"Archi: {config['model']['n_layers']}L-{config['model']['n_heads']}H-{config['model']['d_model']}D")
-print("OK.")
+log(f"Archi: {config['model']['n_layers']}L-{config['model']['n_heads']}H-{config['model']['d_model']}D")
+log(f"Seq:   {config['sequence']['months_lookback']} mois | horizon={config['sequence']['target_horizon']}")
+log(f"Profil: cat={config['data']['profile_categorical_cols']} | num={config['data']['profile_sequence_cols']}")
+log(f"Exclu:  {config['features']['exclude_target_values']}")
+log("OK.")
+log(f"STEP C DONE in {time.time()-t0:.1f}s")
 
 # --------------------------------------------------------------
-print("\n== STEP D: TRAIN ==", datetime.now())
-results = run_training(config)
-print("Train OK.")
+# TRAIN
+# --------------------------------------------------------------
+log("== STEP D: TRAIN ==")
+t0 = time.time()
+try:
+    results = run_training(config)
+    log("Train OK.")
+except Exception as e:
+    log(f"ERREUR TRAIN: {e}\n{traceback.format_exc()}")
+    raise
+log(f"STEP D DONE in {time.time()-t0:.1f}s")
 
 # --------------------------------------------------------------
-print("\n== STEP E: METRICS ==", datetime.now())
+# METRICS
+# --------------------------------------------------------------
+log("== STEP E: METRICS ==")
+t0 = time.time()
 
 # Métriques standard
 m = results.get("metrics", {})
 for k in ["accuracy", "precision", "recall", "f1"]:
     if k in m:
-        print(f"{k:9s} : {m[k]:.4f}")
+        log(f"{k:9s} : {m[k]:.4f}")
 
-# Top-K (si déjà calculées par pipeline_core, elles sont aussi écrites dans T4REC_METRICS)
+# Info modèle / données
+mi = results.get("model_info", {})
+di = results.get("data_info", {})
+log(f"Model: {mi.get('architecture','N/A')} | params≈ {mi.get('total_params','NA'):,}")
+log(f"Data : clients={di.get('n_clients','NA')} | seq_len={di.get('seq_len','NA')} | classes={di.get('n_classes','NA')}")
+
+# Top-K (si dataset écrit par pipeline)
 saved = results.get("saved_datasets", {})
 if "metrics" in saved:
     try:
         met_df = dataiku.Dataset(config["outputs"]["metrics_dataset"]).get_dataframe()
         topk_view = met_df[met_df["metric_type"]=="topk_nbo"].sort_values(["k_value","metric_name"])
-        print("\nTop-K (aperçu, depuis dataset):")
-        print(topk_view.head(20))
+        log("Top-K (échantillon depuis dataset):")
+        print(topk_view.head(20), flush=True)
     except Exception as e:
-        print(f"Lecture métriques dataset impossible (non bloquant): {e}")
+        log(f"Lecture métriques dataset impossible (non bloquant): {e}")
 else:
-    # Affichage léger à partir de l’objet results si besoin
+    # Fallback: calcule un Top-K rapide depuis 'results'
     preds = results.get("predictions", {})
     raw = preds.get("raw_outputs", None)
     y   = preds.get("true_classes", None)
     if raw is not None and y is not None:
-        # petite inférence sur le mapping inverse depuis pipeline (si renvoyé)
-        print("Top-K rapide (calcul local)…")
-        import numpy as np
-        # sans mapping explicite des noms produits ici, on reste sur indices
+        log("Top-K rapide (calcul local sur indices)…")
         inv_map = {i: f"class_{i}" for i in range(raw.shape[1])}
-        tk, _ = evaluate_topk_metrics_nbo(predictions=raw, targets=y, inverse_target_mapping=inv_map, k_values=[1,3,5])
+        tk, _ = evaluate_topk_metrics_nbo(
+            predictions=raw, targets=y, inverse_target_mapping=inv_map, k_values=[1,3,5]
+        )
         for k,v in tk.items():
-            print(f"K={k}: P@K={v['Precision@K']:.4f} | R@K={v['Recall@K']:.4f} | F1@K={v['F1@K']:.4f} | NDCG@K={v['NDCG@K']:.4f}")
+            log(f"K={k}: P@K={v['Precision@K']:.4f} | R@K={v['Recall@K']:.4f} | F1@K={v['F1@K']:.4f} | NDCG@K={v['NDCG@K']:.4f}")
 
-print("\n== DONE ==")
+log(f"STEP E DONE in {time.time()-t0:.1f}s")
 
-
-
-
-
-
+# --------------------------------------------------------------
+total_s = time.time() - start_all
+log(f"=== DRIVER DONE in {total_s:.1f}s ===")
