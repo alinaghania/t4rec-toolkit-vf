@@ -1,43 +1,73 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 
-import os, sys, time, logging, traceback
+
+"""
+DRIVER T4REC — CPU-friendly, in-memory, avec fallbacks anti-dataset vide.
+
+Ce script :
+  1) Construit df_events à partir du dataset Dataiku "BASE_SCORE_COMPLETE_prepared"
+     en lecture chunkée avec filtres progressifs (fallbacks).
+  2) Exclut "Aucune_Proposition" AU NIVEAU ÉVÉNEMENTS (optionnel & recommandé ici),
+     pour éviter un y dégénéré.
+  3) Lance run_training(config) en PASSANT df_events en mémoire (data.events_df).
+  4) Append un CSV "runs_log.csv" avec hyperparams et résultats clés.
+
+→ Objectif : faire tourner un smoke test qui exploite VRAIMENT la dimension temporelle
+ … quand l’historique existe dans les données source.
+"""
+
+import os
+import sys
+import time
+import logging
 from datetime import datetime
+
 import pandas as pd
 import numpy as np
 
+# Dataiku
 import dataiku
-from t4rec_toolkit.pipeline_core import blank_config, run_training
+
+# Ton pipeline
+from t4rec_toolkit.pipeline_core import run_training, blank_config
 
 # =========================
-# PARAMS — SMOKE TEMPORAL
+# CONFIG DRIVER (modifiable)
 # =========================
-DATASET_MAIN      = "BASE_SCORE_COMPLETE_prepared"
-CLIENT_ID_COL     = "NUMTECPRS"
-TIME_COL          = "DATMAJ"
-PRODUCT_COL       = "SOUSCRIPTION_PRODUIT_1M"
 
-LIMIT_ROWS        = 1_000       # augmente progressivement (2000, 5000, 10000…)
-CHUNKSIZE         = 50_000
+# Dataset source & colonnes
+DATASET_MAIN     = "BASE_SCORE_COMPLETE_prepared"
+CLIENT_ID_COL    = "NUMTECPRS"
+TIME_COL         = "DATMAJ"                      # ⚠️ Doit être la vraie date d’événement. Si c'est une date de MAJ unique, remplace par la bonne colonne.
+PRODUCT_COL      = "SOUSCRIPTION_PRODUIT_1M"
+EXTRA_EVENT_COLS = []                            # ex: ["CANAL", "FAMILLE"]
 
-KEEP_MONTHS_INIT  = 12          # fenêtre d’historique de base
-MIN_CLIENT_MONTHS_INIT = 2      # >= 2 mois pour garder l’aspect temporel
-TARGET_EXCLUDE    = ["Aucune_Proposition"]
+# Lecture & bornes
+CHUNKSIZE        = 50_000
+LIMIT_ROWS       = 5_000                         # monte progressivement (5k → 10k → 25k…)
+KEEP_MONTHS_TRY  = [12, 24, 36]                  # gardera le 1er essai qui marche
+MIN_CLIENT_MONTHS_TRY = [2, 1]                   # exige ≥2 mois pour bénéficier du temporel ; sinon fallback à 1
+EXCLUDE_ON_EVENTS = True                         # exclure Aucune_Proposition AVANT cible (évite y dégénéré)
 
-# Modèle / training (CPU-friendly)
+# Cible rare → "AUTRES_PRODUITS"
+MERGE_RARE_THRESHOLD = 50                        # évite de tout merger ; ajuste 20–100 selon volumes
+
+# Hyperparams modèle CPU-friendly
 D_MODEL    = 128
 N_HEADS    = 2
 N_LAYERS   = 2
 BATCH_SIZE = 8
 EPOCHS     = 2
 LEARNING_RATE = 5e-4
-VAL_SPLIT     = 0.20
-MERGE_RARE_THRESHOLD = 1000
+VAL_SPLIT     = 0.2
+
+# Divers
+RANDOM_SEED = 42
+RUNS_CSV    = "runs_log.csv"
 
 # =========================
 # LOGGING
 # =========================
-os.environ["PYTHONUNBUFFERED"] = "1"
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -46,50 +76,63 @@ logging.basicConfig(
 log = logging.getLogger("driver")
 
 # =========================
-# BUILD ONE ATTEMPT
+# HELPERS
 # =========================
-def _build_once(keep_months, min_client_months, exclude_on_events):
+
+def _read_events_chunks(limit_rows:int, keep_months:int) -> pd.DataFrame:
+    """
+    Lit le dataset en chunks, garde uniquement les colonnes utiles,
+    nettoie la date en tz-naive et filtre sur les N derniers mois.
+    S’arrête exactement à limit_rows.
+    """
     src = dataiku.Dataset(DATASET_MAIN)
 
-    # colonnes
+    # Colonnes existantes (robuste)
     try:
         schema_cols = list(src.get_dataframe(limit=0).columns)
     except Exception:
         cfg = src.get_config()
         schema_cols = [c["name"] for c in cfg.get("schema", {}).get("columns", [])]
 
-    need = [CLIENT_ID_COL, TIME_COL, PRODUCT_COL]
-    missing = [c for c in need if c not in schema_cols]
+    cols_needed = [CLIENT_ID_COL, TIME_COL, PRODUCT_COL] + list(EXTRA_EVENT_COLS)
+    missing = [c for c in cols_needed if c not in schema_cols]
     if missing:
         raise ValueError(f"Colonnes manquantes dans {DATASET_MAIN}: {missing}")
 
-    rows_total = 0
+    keep_set = set(cols_needed)
+
     chunks = []
-    log.info(f"[attempt] iter (keep_months={keep_months}, min_client_months={min_client_months}, exclude_on_events={exclude_on_events})")
-    for chunk in src.iter_dataframes(chunksize=CHUNKSIZE, parse_dates=False, infer_with_pandas=True):
-        inter = [c for c in chunk.columns if c in need]
+    rows_total = 0
+
+    log.info("Starting dataframes iterator")
+    for chunk in src.iter_dataframes(
+        chunksize=CHUNKSIZE,
+        parse_dates=False,
+        infer_with_pandas=True
+    ):
+        inter = [c for c in chunk.columns if c in keep_set]
         if not inter:
             continue
-        chunk = chunk[inter].dropna(subset=[CLIENT_ID_COL, TIME_COL])
+        chunk = chunk[inter]
 
-        dt = pd.to_datetime(chunk[TIME_COL], errors="coerce", utc=True).dt.tz_convert(None)
+        # ID/time obligatoires
+        chunk = chunk.dropna(subset=[CLIENT_ID_COL, TIME_COL])
+
+        # Date → datetime tz-naive robuste
+        dt = pd.to_datetime(chunk[TIME_COL], errors="coerce", utc=True)
+        dt = dt.dt.tz_convert(None)
         chunk[TIME_COL] = dt
         chunk = chunk.dropna(subset=[TIME_COL])
 
-        # filtre temporel (None => désactivé)
+        # Filtre N derniers mois si demandé
         if keep_months is not None:
-            cutoff = pd.Timestamp.now().normalize() - pd.DateOffset(months=int(keep_months))
+            cutoff = pd.Timestamp.now().normalize() - pd.DateOffset(months=keep_months)
             chunk = chunk[chunk[TIME_COL] >= cutoff]
-
-        # exclusion côté événements (si demandé)
-        if exclude_on_events and TARGET_EXCLUDE:
-            excl = [s.strip() for s in TARGET_EXCLUDE]
-            chunk = chunk[~chunk[PRODUCT_COL].astype(str).str.strip().isin(excl)]
 
         if chunk.empty:
             continue
 
-        # dédup (client, date)
+        # Dédup stricte par (client, date) -> garde la + récente
         chunk = (
             chunk.sort_values([CLIENT_ID_COL, TIME_COL])
                  .drop_duplicates(subset=[CLIENT_ID_COL, TIME_COL], keep="last")
@@ -97,10 +140,10 @@ def _build_once(keep_months, min_client_months, exclude_on_events):
         if chunk.empty:
             continue
 
-        # respect du LIMIT_ROWS
-        remaining = LIMIT_ROWS - rows_total
+        # Application exacte de LIMIT_ROWS
+        remaining = limit_rows - rows_total
         if remaining <= 0:
-            log.info(f"STOP: limite {LIMIT_ROWS:,} atteinte.")
+            log.info(f"STOP: limite {limit_rows:,} atteinte.")
             break
         if len(chunk) > remaining:
             chunk = chunk.iloc[:remaining]
@@ -108,106 +151,171 @@ def _build_once(keep_months, min_client_months, exclude_on_events):
         chunks.append(chunk)
         rows_total += len(chunk)
         log.info(f"   + {len(chunk):,} rows (cum={rows_total:,})")
-        if rows_total >= LIMIT_ROWS:
-            log.info(f"STOP: limite {LIMIT_ROWS:,} atteinte.")
+
+        if rows_total >= limit_rows:
+            log.info(f"STOP: limite {limit_rows:,} atteinte.")
             break
 
-    df = pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame(columns=need)
-
-    # garder clients avec >= min_client_months mois
-    if not df.empty and min_client_months and min_client_months > 1:
-        months_per_client = (
-            df.assign(_month=df[TIME_COL].dt.to_period("M"))
-              .groupby(CLIENT_ID_COL)["_month"].nunique()
-        )
-        keep_ids = set(months_per_client[months_per_client >= min_client_months].index)
-        before = len(df)
-        df = df[df[CLIENT_ID_COL].isin(keep_ids)]
-        log.info(f"Filtre MIN_CLIENT_MONTHS>={min_client_months}: {before:,}→{len(df):,} lignes; clients={len(keep_ids):,}")
+    if chunks:
+        df = pd.concat(chunks, ignore_index=True)
+    else:
+        df = pd.DataFrame(columns=cols_needed)
 
     return df
 
+
+def _filter_min_client_months(df: pd.DataFrame, min_client_months:int) -> pd.DataFrame:
+    """
+    Garde les (client, mois) et filtre les clients avec >= min_client_months.
+    """
+    if df.empty:
+        return df
+    tmp = df.copy()
+    tmp["_month"] = tmp[TIME_COL].dt.to_period("M")
+    grp = tmp.groupby(CLIENT_ID_COL)["_month"].nunique()
+    keep_ids = set(grp[grp >= min_client_months].index)
+    out = tmp[tmp[CLIENT_ID_COL].isin(keep_ids)].drop(columns=["_month"])
+    log.info(f"Filtre MIN_CLIENT_MONTHS>={min_client_months}: {len(df)}→{len(out)} lignes; clients={len(keep_ids)}")
+    return out
+
+
+def build_events_with_fallbacks(limit_rows:int) -> tuple[pd.DataFrame, dict]:
+    """
+    Essaie plusieurs combinaisons (keep_months, min_client_months, exclusion) pour
+    garantir un df_events non vide et si possible T>=2.
+    Retourne (df_events, meta).
+    """
+    attempts_meta = []
+    # 1) EXCLUDE_ON_EVENTS tel quel
+    # 2) Si rien → désactive exclusion pour débloquer
+    exclude_flags = [EXCLUDE_ON_EVENTS, False] if EXCLUDE_ON_EVENTS else [False]
+
+    try_num = 0
+    for exclude_flag in exclude_flags:
+        for km in KEEP_MONTHS_TRY:
+            for mcm in MIN_CLIENT_MONTHS_TRY:
+                try_num += 1
+                log.info(f"--- Attempt {try_num}/{len(exclude_flags)*len(KEEP_MONTHS_TRY)*len(MIN_CLIENT_MONTHS_TRY)} ---")
+                log.info(f"[attempt] iter (keep_months={km}, min_client_months={mcm}, exclude_on_events={exclude_flag})")
+
+                df = _read_events_chunks(limit_rows=limit_rows, keep_months=km)
+                if df.empty:
+                    attempts_meta.append((km, mcm, exclude_flag, "read=empty"))
+                    continue
+
+                # Exclusion au niveau événements (optionnel)
+                if exclude_flag:
+                    before = len(df)
+                    df = df[df[PRODUCT_COL].astype(str).str.strip() != "Aucune_Proposition"]
+                    after = len(df)
+                    log.info(f"Exclusion événement 'Aucune_Proposition': {before}→{after}")
+
+                # Filtre profondeur temporelle client
+                df = _filter_min_client_months(df, mcm)
+
+                # Check
+                if df.empty:
+                    attempts_meta.append((km, mcm, exclude_flag, "post-filter=empty"))
+                    log.info(f"Attempt {try_num} result: shape=(0, 3)")
+                    continue
+
+                # Stats rapides
+                log.info(f"Attempt {try_num} result: shape={df.shape}")
+                try:
+                    log.info(f"\n{df.head(8).to_string(index=False)}")
+                except:
+                    pass
+
+                n_clients = df[CLIENT_ID_COL].nunique()
+                n_months = df[TIME_COL].dt.to_period("M").nunique()
+                log.info(f"Stats — rows={len(df):,} | clients uniques={n_clients:,} | mois distincts={n_months}")
+
+                # Distribution cible
+                try:
+                    vc = df[PRODUCT_COL].astype(str).value_counts()
+                    log.info("Top target values:\n" + vc.head(10).to_string())
+                except:
+                    pass
+
+                return df, {
+                    "keep_months": km,
+                    "min_client_months": mcm,
+                    "exclude_on_events": exclude_flag,
+                    "n_clients": int(n_clients),
+                    "n_months": int(n_months),
+                }
+
+    # Fallback ultime : si tout vide, on lit sans filtre mois + sans exclusion + min_client_months=1
+    log.warning("Tous les essais ont échoué → fallback ULTIME (no exclude, no month filter, mcm=1)")
+    df = _read_events_chunks(limit_rows=limit_rows, keep_months=None)
+    df = _filter_min_client_months(df, 1)
+    if df.empty:
+        raise RuntimeError("df_events est vide malgré le fallback ultime : vérifie TIME_COL, LIMIT_ROWS, et que le dataset contient des dates parsables.")
+    n_clients = df[CLIENT_ID_COL].nunique()
+    n_months = df[TIME_COL].dt.to_period("M").nunique()
+    return df, {
+        "keep_months": None,
+        "min_client_months": 1,
+        "exclude_on_events": False,
+        "n_clients": int(n_clients),
+        "n_months": int(n_months),
+    }
+
+
 # =========================
-# STEP 1 — BUILD with FALLBACKS
+# MAIN
 # =========================
-def build_df_events_with_fallbacks():
+
+def main():
+    start_all = time.time()
+    np.random.seed(RANDOM_SEED)
+
+    log.info("=== DRIVER START (in-memory, with fallbacks) ===")
+
+    # ---- STEP 1: BUILD EVENTS ----
     log.info("== STEP 1: BUILD EVENTS (with fallbacks) ==")
+    df_events, meta = build_events_with_fallbacks(limit_rows=LIMIT_ROWS)
 
-    km = KEEP_MONTHS_INIT
-    mm = MIN_CLIENT_MONTHS_INIT
-
-    attempts = [
-        (km,       mm, True),   # nominal
-        (km*2,     mm, True),   # élargir fenêtre
-        (km*3,     mm, True),
-        (km*2,     1,  True),   # assouplir contrainte client
-        (km*3,     1,  True),
-        (km*3,     1,  False),  # dernier recours: pas d'exclusion côté événements
-        (None,     1,  False),  # secours absolu: toute la période dispo
-    ]
-
-    for i, (keep_m, min_m, excl_ev) in enumerate(attempts, 1):
-        log.info(f"--- Attempt {i}/{len(attempts)} ---")
-        df = _build_once(keep_m, min_m, excl_ev)
-        log.info(f"Attempt {i} result: shape={df.shape}")
-        if not df.empty:
-            # petit récap
-            try:
-                log.info(df.head(8).to_string(index=False))
-                log.info(
-                    "Stats — rows=%s | clients uniques=%s | mois distincts=%s",
-                    f"{len(df):,}",
-                    f"{df[CLIENT_ID_COL].nunique():,}",
-                    df[TIME_COL].dt.to_period("M").nunique(),
-                )
-                log.info("Top target values:\n" + df[PRODUCT_COL].astype(str).value_counts().head(10).to_string())
-            except Exception:
-                pass
-            # on retourne le df ET l’info si on a exclu côté events
-            return df, excl_ev
-
-    raise RuntimeError("Impossible d'obtenir des événements non vides même après fallbacks (élargir LIMIT_ROWS ou vérifier les données).")
-
-# =========================
-# STEP 2 — CONFIG
-# =========================
-def make_config(df_events, excluded_on_events: bool) -> dict:
+    # ---- STEP 2: CONFIG ----
     log.info("== STEP 2: CONFIG (in-memory, no IO) ==")
     cfg = blank_config()
 
-    # données (in-memory)
-    cfg["data"]["events_df"]        = df_events
-    cfg["data"]["client_id_col"]    = CLIENT_ID_COL
-    cfg["data"]["event_time_col"]   = TIME_COL
-    cfg["data"]["product_col"]      = PRODUCT_COL
-    cfg["data"]["event_extra_cols"] = []   # pas de profil pour limiter la RAM
+    # Données (passage in-memory → pas d’I/O Dataiku pour events)
+    cfg["data"]["events_df"]          = df_events
+    cfg["data"]["events_dataset"]     = ""                 # on n'utilise pas
+    cfg["data"]["dataset_name"]       = ""                 # pas de profil pour smoke test RAM-light
+    cfg["data"]["client_id_col"]      = CLIENT_ID_COL
+    cfg["data"]["event_time_col"]     = TIME_COL
+    cfg["data"]["product_col"]        = PRODUCT_COL
+    cfg["data"]["event_extra_cols"]   = []                 # garder vide pour RAM
 
-    # séquence
-    # on met months_lookback à min(KEEP_MONTHS_INIT, nb_mois dispo)
-    n_months_dispo = int(df_events[TIME_COL].dt.to_period("M").nunique())
-    eff_lookback = min(KEEP_MONTHS_INIT, max(1, n_months_dispo))
-    cfg["sequence"]["months_lookback"]          = eff_lookback
+    # Séquence (si un seul mois trouvé, on laisse months_lookback=1 pour éviter du padding vide)
+    months_lb = 12
+    if meta.get("n_months", 1) < 2:
+        months_lb = 1
+    cfg["sequence"]["months_lookback"]          = months_lb
     cfg["sequence"]["time_granularity"]         = "M"
     cfg["sequence"]["min_events_per_client"]    = 1
     cfg["sequence"]["target_horizon"]           = 1
     cfg["sequence"]["pad_value"]                = 0
     cfg["sequence"]["build_target_from_events"] = True
 
-    # cible — si on n’a PAS pu exclure côté événements,
-    # on sécurise l’exclusion côté y (dans run_training)
-    cfg["features"]["exclude_target_values"] = TARGET_EXCLUDE if not excluded_on_events else TARGET_EXCLUDE
+    # Cible / features
+    # IMPORTANT : comme on a potentiellement exclu "Aucune_Proposition" au niveau événements,
+    # on NE la re-exclut PAS ici pour éviter des désalignements (laisser liste vide).
+    cfg["features"]["exclude_target_values"] = []
     cfg["features"]["merge_rare_threshold"]  = MERGE_RARE_THRESHOLD
     cfg["features"]["other_class_name"]      = "AUTRES_PRODUITS"
 
-    # modèle
+    # Modèle (CPU-friendly)
     cfg["model"]["d_model"]             = D_MODEL
     cfg["model"]["n_heads"]             = N_HEADS
     cfg["model"]["n_layers"]            = N_LAYERS
     cfg["model"]["dropout"]             = 0.10
-    cfg["model"]["max_sequence_length"] = eff_lookback
+    cfg["model"]["max_sequence_length"] = months_lb
     cfg["model"]["vocab_size"]          = 2000
 
-    # training
+    # Training
     cfg["training"]["batch_size"]      = BATCH_SIZE
     cfg["training"]["num_epochs"]      = EPOCHS
     cfg["training"]["learning_rate"]   = LEARNING_RATE
@@ -217,64 +325,84 @@ def make_config(df_events, excluded_on_events: bool) -> dict:
     cfg["training"]["gradient_clip"]   = 1.0
     cfg["training"]["optimizer"]       = "adamw"
 
-    # sorties désactivées (smoke)
+    # Sorties (on ne les utilise pas pendant le smoke ; pas de Dataiku write ici)
     cfg["outputs"]["features_dataset"]        = None
     cfg["outputs"]["predictions_dataset"]     = None
     cfg["outputs"]["metrics_dataset"]         = None
     cfg["outputs"]["model_artifacts_dataset"] = None
     cfg["outputs"]["local_dir"]               = "output"
 
-    # runtime
+    # Runtime
     cfg["runtime"]["verbose"]  = True
     cfg["runtime"]["progress"] = True
-    cfg["runtime"]["seed"]     = 42
+    cfg["runtime"]["seed"]     = RANDOM_SEED
 
     log.info(f"Archi: {cfg['model']['n_layers']}L-{cfg['model']['n_heads']}H-{cfg['model']['d_model']}D")
     log.info(f"Seq:   {cfg['sequence']['months_lookback']} mois | horizon={cfg['sequence']['target_horizon']}")
-    log.info(f"Exclu (events level)?: {excluded_on_events}")
+    log.info(f"Exclu (events level)?: {meta.get('exclude_on_events')}")
     log.info("OK config.")
-    return cfg
 
-# =========================
-# TRAIN & SUMMARY
-# =========================
-def train(cfg):
+    # ---- STEP 3: TRAIN ----
     log.info("== STEP 3: TRAIN (CPU) ==")
-    t0 = time.time()
-    try:
-        results = run_training(cfg)
-        log.info("Training finished.")
-    except Exception as e:
-        log.error(f"ERREUR TRAIN: {e}\n{traceback.format_exc()}")
-        raise
-    log.info(f"Train time: {time.time()-t0:.1f}s")
-    return results
+    results = run_training(cfg)
+    log.info("Training finished.")
+    log.info(f"Train time: {results.get('execution_time', 0.0):.1f}s")
 
-def print_summary(results):
-    m = results.get("metrics", {})
-    di = results.get("data_info", {})
+    # ---- STEP 4: MÉTRIQUES ----
+    log.info("== STEP 4: METRICS ==")
+    m  = results.get("metrics", {})
     mi = results.get("model_info", {})
-
-    for k in ["accuracy", "precision", "recall", "f1"]:
-        if k in m:
-            log.info(f"{k:9s} : {m[k]:.4f}")
-
+    di = results.get("data_info", {})
+    log.info(f"accuracy  : {m.get('accuracy', 0.0):.4f}")
+    log.info(f"precision : {m.get('precision', 0.0):.4f}")
+    log.info(f"recall    : {m.get('recall', 0.0):.4f}")
+    log.info(f"f1        : {m.get('f1', 0.0):.4f}")
     log.info(f"Model: {mi.get('architecture','N/A')} | params≈ {mi.get('total_params','NA'):,}")
     log.info(f"Data : clients={di.get('n_clients','NA')} | seq_len={di.get('seq_len','NA')} | classes={di.get('n_classes','NA')}")
 
-# =========================
-# MAIN
-# =========================
-if __name__ == "__main__":
-    log.info("=== DRIVER START (in-memory, with fallbacks) ===")
+    # ---- STEP 5: APPEND CSV RUNS ----
     try:
-        df_events, excluded_on_events = build_df_events_with_fallbacks()
+        run_row = {
+            "timestamp": pd.Timestamp.now(),
+            # dataset sampling
+            "limit_rows": LIMIT_ROWS,
+            "keep_months_effective": meta.get("keep_months"),
+            "min_client_months_effective": meta.get("min_client_months"),
+            "exclude_on_events": meta.get("exclude_on_events"),
+            "n_clients_events": meta.get("n_clients"),
+            "n_months_events": meta.get("n_months"),
+            # training config
+            "months_lookback": cfg["sequence"]["months_lookback"],
+            "d_model": cfg["model"]["d_model"],
+            "n_heads": cfg["model"]["n_heads"],
+            "n_layers": cfg["model"]["n_layers"],
+            "batch_size": cfg["training"]["batch_size"],
+            "epochs": cfg["training"]["num_epochs"],
+            "lr": cfg["training"]["learning_rate"],
+            "merge_rare_threshold": cfg["features"]["merge_rare_threshold"],
+            # results
+            "seq_len_effective": di.get("seq_len"),
+            "n_clients_train": di.get("n_clients"),
+            "n_classes": di.get("n_classes"),
+            "accuracy": m.get("accuracy"),
+            "precision": m.get("precision"),
+            "recall": m.get("recall"),
+            "f1": m.get("f1"),
+            "train_time_s": results.get("execution_time"),
+        }
+        df_log = pd.DataFrame([run_row])
+        if os.path.exists(RUNS_CSV):
+            df_log.to_csv(RUNS_CSV, mode="a", header=False, index=False)
+        else:
+            df_log.to_csv(RUNS_CSV, index=False)
+        log.info(f"Run append -> {RUNS_CSV}")
     except Exception as e:
-        log.error(str(e))
-        sys.exit(1)
+        log.warning(f"Impossible d’écrire le CSV de run: {e}")
 
-    cfg = make_config(df_events, excluded_on_events)
-    results = train(cfg)
-    print_summary(results)
-    log.info("=== DRIVER DONE ===")
+    log.info(f"=== DRIVER DONE in {time.time()-start_all:.1f}s ===")
+
+
+if __name__ == "__main__":
+    main()
+
 
