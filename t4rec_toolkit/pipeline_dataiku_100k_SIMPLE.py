@@ -1,54 +1,53 @@
-# -*- coding: utf-8 -*-
-"""
-Driver 'bounded events' + (optionnel) mini-train CPU
-- Lit le dataset source en chunks
-- Filtre sur N derniers mois, exclut des labels, limite à LIMIT_ROWS
-- Garde-fous pour éviter un df_events vide (relaxation progressive)
-- Ecrit df_event + results
-- Optionnel: lance un petit entraînement CPU via pipeline_core.run_training
-"""
 
-import os, sys, time, logging
+import os, sys, time, json, logging
 from datetime import datetime
-import pandas as pd
-import numpy as np
+from typing import Optional, Tuple, Dict, Any, List
 
-# ==== Dataiku ====
+import numpy as np
+import pandas as pd
+
+# --- Dataiku  ---
 import dataiku
 
-# ==== Ton toolkit ====
-from t4rec_toolkit.pipeline_core import blank_config, run_training
+# ---  toolkit ---
+from t4rec_toolkit.pipeline_core import run_training, blank_config
 
-# ---------------- CONFIG ----------------
-DATASET_MAIN        = "BASE_SCORE_COMPLETE_prepared"   # dataset source
-OUT_EVENTS_NAME     = "df_event"                       # dataset de sortie events (crée-le dans le Flow)
-OUT_RESULTS_NAME    = "results"                        # dataset de logs (crée-le dans le Flow)
+# ===================== CONFIG UTILISATEUR =========================
+# Dataset source (profil + événements sont dans la même table ici)
+DATASET_MAIN     = "BASE_SCORE_COMPLETE_prepared"
 
-CLIENT_ID_COL       = "NUMTECPRS"
-TIME_COL            = "DATMAJ"                         # fin de mois
-PRODUCT_COL         = "SOUSCRIPTION_PRODUIT_1M"
+# Colonnes
+CLIENT_ID_COL    = "NUMTECPRS"
+TIME_COL         = "DATMAJ"
+PRODUCT_COL      = "SOUSCRIPTION_PRODUIT_1M"
+EXTRA_EVENT_COLS = []  # ex: ["CANAL","FAMILLE"]
 
-EXCLUDE_LABELS      = ("Aucune_Proposition",)          # labels à exclure
-KEEP_MONTHS         = 12                                # fenêtre temporelle (None = no filter)
-MIN_CLIENT_MONTHS   = 1                                 # nb min de mois par client (1 = pas de contrainte)
-CHUNKSIZE           = 200_000                           # chunk lecture
-LIMIT_ROWS          = 10_000                            # STRICT hard-stop sur les lignes retenues
+# Échantillonnage / smoke
+LIMIT_ROWS          = 100_000        # nombre max de lignes events à construire (smoke)
+MONTHS_BACK_TARGET  = 6            # combien de mois récents on cible
+PER_MONTH_CAP       = None         # None => auto (LIMIT_ROWS // MONTHS_BACK_TARGET)
+MIN_CLIENT_MONTHS   = 2            # on veut >= 2 mois / client (temporal)
+EXCLUDE_ON_EVENTS   = True         # exclure "Aucune_Proposition" côté événements
+RANDOM_SEED         = 42
 
-# Entraînement (toggle)
-TRAIN_MODEL         = True                              # False pour juste tester le build
-LOOKBACK_FOR_MODEL  = 6                                 # <= nb de mois retenus réels
-D_MODEL             = 128
-N_HEADS             = 2
-N_LAYERS            = 2
-BATCH_SIZE          = 8
-EPOCHS              = 2
-MERGE_RARE_THRESHOLD= 1000
-VAL_SPLIT           = 0.2
-LEARNING_RATE       = 5e-4
+# Hyperparams (CPU-friendly)
+D_MODEL    = 128
+N_HEADS    = 2
+N_LAYERS   = 2
+BATCH_SIZE = 8
+EPOCHS     = 2
+LEARNING_RATE = 5e-4
+VAL_SPLIT     = 0.20
 
-# -----------------------------------------
+# Classes rares (réduit la tête de classe)
+MERGE_RARE_THRESHOLD = 1000
+OTHER_CLASS_NAME     = "AUTRES_PRODUITS"
 
-# ==== Logging ====
+# Sorties
+OUT_DIR = "output"
+EXP_LOG_CSV = os.path.join(OUT_DIR, "experiment_log.csv")
+
+# ===================== LOGGING =========================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -56,273 +55,340 @@ logging.basicConfig(
 )
 log = logging.getLogger("driver")
 
-def month_cutoff(n_months: int):
-    if n_months is None:
-        return None
-    now = pd.Timestamp.now().normalize()
-    # DATMAJ est fin de mois → on prend la même granularité (période M)
-    return (now - pd.DateOffset(months=n_months)).to_period("M").to_timestamp(how="end")
 
-def build_events_bounded(
-    ds_name: str,
-    limit_rows: int,
-    keep_months: int | None,
-    min_client_months: int,
-    exclude_labels: tuple[str, ...],
-    chunksize: int,
-) -> pd.DataFrame:
-    """
-    Lecture chunkée + filtres + hard stop. Pas de param 'partitions'.
-    Garde-fous: si vide, on relaxe automatiquement.
-    """
-    src = dataiku.Dataset(ds_name)
-
-    # 1) découverte colonnes (sans API non-portable)
+# ===================== HELPERS =========================
+def _to_month_label(p: str) -> str:
+    """Normalise une partition/valeur en libellé 'YYYY-MM'."""
     try:
-        schema_cols = list(src.get_dataframe(limit=0).columns)
+        return pd.to_datetime(p).strftime("%Y-%m")
     except Exception:
-        cfg = src.get_config()
-        schema_cols = [c["name"] for c in cfg.get("schema", {}).get("columns", [])]
+        if isinstance(p, str) and len(p) == 7 and p[4] == "-":
+            return p
+        if isinstance(p, str) and len(p) in (6, 8) and p[:4].isdigit():
+            if len(p) == 6:
+                return f"{p[:4]}-{p[4:]}"
+            if len(p) == 8:
+                return f"{p[:4]}-{p[4:6]}"
+        return str(p)
 
-    cols_needed = [CLIENT_ID_COL, TIME_COL, PRODUCT_COL]
-    missing = [c for c in cols_needed if c not in schema_cols]
-    if missing:
-        raise ValueError(f"Colonnes manquantes dans {ds_name}: {missing}")
 
-    # 2) itération
-    cutoff = month_cutoff(keep_months)
-    rows_total = 0
-    chunks = []
+def _list_month_partitions(ds: dataiku.Dataset) -> List[str]:
+    """Liste des mois disponibles (partitionnés DSS ou inférés via DATMAJ)."""
+    # 1) Dataset partitionné ?
+    try:
+        parts = ds.list_partitions()
+        parts = sorted(parts, reverse=True)
+        if parts:
+            return [_to_month_label(x) for x in parts]
+    except Exception:
+        pass
 
-    log.info(f"[STEP1] limit_rows={limit_rows:,} | keep_months={keep_months} | exclude={exclude_labels}")
-
-    for chunk in src.iter_dataframes(chunksize=chunksize, parse_dates=False, infer_with_pandas=True):
-        # garde uniquement le nécessaire
-        inter = [c for c in chunk.columns if c in cols_needed]
-        if not inter:
-            continue
-        chunk = chunk[inter].dropna(subset=[CLIENT_ID_COL, TIME_COL])
-
-        # parse DATMAJ → fin de mois tz-naive
-        dt = pd.to_datetime(chunk[TIME_COL], errors="coerce", utc=False)
-        chunk = chunk.assign(**{TIME_COL: dt}).dropna(subset=[TIME_COL])
-
-        # normalise à fin de mois (au cas où)
-        chunk[TIME_COL] = chunk[TIME_COL].dt.to_period("M").dt.to_timestamp(how="end")
-
-        # filtre temporel
-        if cutoff is not None:
-            chunk = chunk[chunk[TIME_COL] >= cutoff]
-
-        # exclure labels indésirables (au niveau events)
-        if exclude_labels:
-            chunk = chunk[~chunk[PRODUCT_COL].astype(str).str.strip().isin(exclude_labels)]
-
-        if chunk.empty:
-            continue
-
-        # dédup (client, date) → garder la + récente (au cas où)
-        chunk = (
-            chunk.sort_values([CLIENT_ID_COL, TIME_COL])
-                 .drop_duplicates(subset=[CLIENT_ID_COL, TIME_COL], keep="last")
-        )
-
-        # tronquage pour respecter la limite stricte
-        remaining = limit_rows - rows_total
-        if remaining <= 0:
+    # 2) Fallback: scanner DATMAJ en chunks
+    months = set()
+    cols = [CLIENT_ID_COL, TIME_COL, PRODUCT_COL]
+    for ch in ds.iter_dataframes(chunksize=200_000, parse_dates=False, infer_with_pandas=True, columns=cols):
+        dt = pd.to_datetime(ch[TIME_COL], errors="coerce", utc=True).dt.tz_convert(None)
+        months.update(dt.dropna().dt.to_period("M").astype(str).unique().tolist())
+        if len(months) >= 48:
             break
-        if len(chunk) > remaining:
-            chunk = chunk.iloc[:remaining]
+    return sorted(list(months), reverse=True)
 
-        chunks.append(chunk)
-        rows_total += len(chunk)
-        log.info(f"   + {len(chunk):,} rows (cum={rows_total:,})")
-        if rows_total >= limit_rows:
-            log.info("STOP: limit %s reached.", f"{limit_rows:,}")
-            break
 
-    df_events = pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame(columns=cols_needed)
+def _read_month_sample(
+    ds: dataiku.Dataset,
+    month_label: str,
+    per_month_cap: int,
+    exclude_on_events: bool
+) -> pd.DataFrame:
+    """Lit un échantillon pour un mois donné (partitionné ou filtré sur DATMAJ)."""
+    cols = [CLIENT_ID_COL, TIME_COL, PRODUCT_COL] + list(EXTRA_EVENT_COLS)
 
-    # 3) filtre clients avec au moins X mois (si T>1)
-    if min_client_months > 1 and not df_events.empty:
-        cnt = df_events.groupby(CLIENT_ID_COL)[TIME_COL].nunique()
-        keep_clients = set(cnt[cnt >= min_client_months].index)
-        before = len(df_events)
-        df_events = df_events[df_events[CLIENT_ID_COL].isin(keep_clients)]
-        log.info(f"Filtre MIN_CLIENT_MONTHS>={min_client_months}: {before:,}→{len(df_events):,} lignes; clients={len(keep_clients):,}")
+    # 1) Tentative "partitions"
+    try:
+        df = ds.get_dataframe(partitions=month_label, columns=cols, limit=None)
+        if per_month_cap and len(df) > per_month_cap:
+            df = df.sample(n=per_month_cap, random_state=RANDOM_SEED)
+    except Exception:
+        # 2) Fallback: filtrer DATMAJ == month_label
+        df_list = []
+        for ch in ds.iter_dataframes(chunksize=200_000, parse_dates=False, infer_with_pandas=True, columns=cols):
+            dt = pd.to_datetime(ch[TIME_COL], errors="coerce", utc=True).dt.tz_convert(None)
+            ch = ch.loc[dt.dt.to_period("M").astype(str) == month_label, cols]
+            if not ch.empty:
+                df_list.append(ch)
+            if sum(len(x) for x in df_list) >= max(per_month_cap or 0, 5_000):
+                break
+        df = pd.concat(df_list, ignore_index=True) if df_list else pd.DataFrame(columns=cols)
+        if per_month_cap and len(df) > per_month_cap:
+            df = df.sample(n=per_month_cap, random_state=RANDOM_SEED)
 
-    return df_events
+    if df.empty:
+        return df
 
-def ensure_non_empty_events() -> pd.DataFrame:
-    """
-    Essaie plusieurs relaxations si vide.
-    """
-    tries = [
-        dict(keep_months=KEEP_MONTHS, min_client_months=MIN_CLIENT_MONTHS, exclude_labels=EXCLUDE_LABELS),
-        dict(keep_months=KEEP_MONTHS, min_client_months=1,                  exclude_labels=EXCLUDE_LABELS),
-        dict(keep_months=None,        min_client_months=1,                  exclude_labels=EXCLUDE_LABELS),
-        dict(keep_months=None,        min_client_months=1,                  exclude_labels=tuple()),
-    ]
-    for i, t in enumerate(tries, 1):
-        log.info(f"--- Attempt {i}/{len(tries)} ---")
-        df_ev = build_events_bounded(
-            ds_name=DATASET_MAIN,
-            limit_rows=LIMIT_ROWS,
-            keep_months=t["keep_months"],
-            min_client_months=t["min_client_months"],
-            exclude_labels=t["exclude_labels"],
-            chunksize=CHUNKSIZE,
-        )
-        log.info(f"Attempt {i} result: shape={df_ev.shape}")
-        if not df_ev.empty:
-            return df_ev
-    # si toujours vide → on prend un micro-sample brut (aucun filtre)
-    log.warning("Tous les essais vides. On prend un micro-sample brut (1000 lignes) sans filtre.")
-    src = dataiku.Dataset(DATASET_MAIN)
-    df = src.get_dataframe(limit=1_000)[[CLIENT_ID_COL, TIME_COL, PRODUCT_COL]].copy()
-    df[TIME_COL] = pd.to_datetime(df[TIME_COL], errors="coerce").dt.to_period("M").dt.to_timestamp(how="end")
+    # Nettoyage date + filtres
+    df[TIME_COL] = pd.to_datetime(df[TIME_COL], errors="coerce", utc=True).dt.tz_convert(None)
     df = df.dropna(subset=[CLIENT_ID_COL, TIME_COL])
+
+    if exclude_on_events:
+        df = df[df[PRODUCT_COL].astype(str).str.strip() != "Aucune_Proposition"]
+
+    if df.empty:
+        return df
+
+    # Dédup stricte (client, date)
+    df = (df.sort_values([CLIENT_ID_COL, TIME_COL])
+            .drop_duplicates(subset=[CLIENT_ID_COL, TIME_COL], keep="last"))
     return df
 
-def write_dataset_safe(ds_name: str, df: pd.DataFrame):
-    ds = dataiku.Dataset(ds_name)
-    ds.write_with_schema(df)
 
-def main():
-    log.info("=== DRIVER START (bounded events) ===")
+def build_events_stratified_across_months(
+    limit_rows: int,
+    months_back: int,
+    per_month_cap: Optional[int],
+    min_client_months: int,
+    exclude_on_events: bool
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """
+    Échantillonne plusieurs mois récents, applique une profondeur min par client,
+    puis tronque à `limit_rows`. Si vide, relaxe progressivement pour garantir un retour non vide.
+    """
+    ds = dataiku.Dataset(DATASET_MAIN)
+    months_all = _list_month_partitions(ds)
+    if not months_all:
+        raise RuntimeError("Impossible d'inférer les mois/partitions disponibles.")
 
-    # 1) BUILD EVENTS (avec garde-fous)
-    df_events = ensure_non_empty_events()
+    target_months = months_all[:max(1, months_back)]
+    if not per_month_cap or per_month_cap <= 0:
+        per_month_cap = max(100, limit_rows // max(1, len(target_months)))
 
-    # 1.b) Stats rapides
-    if df_events.empty:
-        raise RuntimeError("df_events est vide malgré les fallbacks.")
-    log.info("\n%s", df_events.head(8))
-    n_clients = df_events[CLIENT_ID_COL].nunique()
-    n_months  = df_events[TIME_COL].dt.to_period("M").nunique()
-    log.info("Stats — rows=%s | clients=%s | months=%s", f"{len(df_events):,}", f"{n_clients:,}", f"{n_months}")
+    # Lecture stratifiée
+    chunks = []
+    total = 0
+    for m in target_months:
+        dfm = _read_month_sample(ds, m, per_month_cap=per_month_cap, exclude_on_events=exclude_on_events)
+        if not dfm.empty:
+            chunks.append(dfm)
+            total += len(dfm)
+        if total >= limit_rows * 2:
+            break
 
-    vc = df_events[PRODUCT_COL].astype(str).value_counts()
-    log.info("Top target values:\n%s", vc.head(10))
+    base_cols = [CLIENT_ID_COL, TIME_COL, PRODUCT_COL] + list(EXTRA_EVENT_COLS)
+    df = pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame(columns=base_cols)
 
-    # 2) WRITE df_event (sortie n°1)
-    write_dataset_safe(OUT_EVENTS_NAME, df_events)
-    log.info("Wrote %s: %s", OUT_EVENTS_NAME, df_events.shape)
+    # --- Fallbacks garantissant le non-vide ---
+    # F1: si vide, réessaie sans exclusion événements
+    if df.empty and exclude_on_events:
+        for m in target_months:
+            dfm = _read_month_sample(ds, m, per_month_cap=per_month_cap, exclude_on_events=False)
+            if not dfm.empty:
+                chunks.append(dfm)
+        df = pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame(columns=base_cols)
 
-    # 3) (OPTIONNEL) TRAIN
-    results_row = {
-        "run_id":            f"run_{int(time.time())}",
-        "ts":                pd.Timestamp.now(),
-        "rows_scanned":      int(len(df_events)),
-        "rows_kept":         int(len(df_events)),
-        "keep_months":       int(KEEP_MONTHS) if KEEP_MONTHS is not None else None,
-        "min_client_months": int(MIN_CLIENT_MONTHS),
-        "limit_rows":        int(LIMIT_ROWS),
-        "chunksize":         int(CHUNKSIZE),
-        "time_budget_secs":  None,
-        "n_chunks":          None,
-        "seq_lookback":      int(min(LOOKBACK_FOR_MODEL, int(n_months) if n_months else LOOKBACK_FOR_MODEL)),
-        "d_model":           int(D_MODEL),
-        "n_heads":           int(N_HEADS),
-        "n_layers":          int(N_LAYERS),
-        "batch_size":        int(BATCH_SIZE),
-        "merge_rare_threshold": int(MERGE_RARE_THRESHOLD),
-        "exclude_labels":    ",".join(EXCLUDE_LABELS) if EXCLUDE_LABELS else "",
-        "n_classes":         None,
-        "val_accuracy":      None,
-        "precision":         None,
-        "recall":            None,
-        "f1":                None,
-        "train_seconds":     None,
-        "notes":             "bounded events",
+    # F2: si encore vide, élargis à +months
+    i = len(target_months)
+    while df.empty and i < min(len(months_all), months_back * 3):
+        m = months_all[i]
+        dfm = _read_month_sample(ds, m, per_month_cap=per_month_cap, exclude_on_events=False)
+        if not dfm.empty:
+            chunks.append(dfm)
+        df = pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame(columns=base_cols)
+        i += 1
+
+    if df.empty:
+        raise RuntimeError("df_events vide après tous les fallbacks (vérifie colonnes/données).")
+
+    # Profondeur min par client
+    tmp = df.copy()
+    tmp["_m"] = tmp[TIME_COL].dt.to_period("M")
+    keep_ids = tmp.groupby(CLIENT_ID_COL)["_m"].nunique()
+    keep_ids = set(keep_ids[keep_ids >= min_client_months].index)
+    df_kept = tmp[tmp[CLIENT_ID_COL].isin(keep_ids)].drop(columns=["_m"])
+
+    # F3: si vide après filtre profondeur, relaxe à 1 mois min
+    if df_kept.empty:
+        df_kept = tmp.drop(columns=["_m"])
+
+    # Équilibrage par mois + tronque à limit_rows
+    df_kept["_month"] = df_kept[TIME_COL].dt.to_period("M").astype(str)
+    n_target_months = df_kept["_month"].nunique()
+    per_m = max(1, int(np.ceil(limit_rows / max(1, n_target_months))))
+    df_kept = (df_kept.groupby("_month", group_keys=False).apply(lambda g: g.head(per_m)))
+    df_kept = df_kept.drop(columns=["_month"]).head(limit_rows).reset_index(drop=True)
+
+    n_clients = df_kept[CLIENT_ID_COL].nunique()
+    n_months  = df_kept[TIME_COL].dt.to_period("M").nunique()
+
+    meta = {
+        "selected_months": target_months,
+        "per_month_cap": per_month_cap,
+        "exclude_on_events": exclude_on_events,
+        "n_clients": int(n_clients),
+        "n_months": int(n_months),
     }
+    return df_kept, meta
 
-    if TRAIN_MODEL:
-        log.info("== TRAIN: minimal CPU config ==")
-        t0 = time.time()
-        cfg = blank_config()
-        # alimentation en mémoire pour éviter des I/O
-        cfg["data"]["events_df"]            = df_events[[CLIENT_ID_COL, TIME_COL, PRODUCT_COL]].copy()
-        cfg["data"]["events_dataset"]       = ""  # non utilisé
-        cfg["data"]["client_id_col"]        = CLIENT_ID_COL
-        cfg["data"]["event_time_col"]       = TIME_COL
-        cfg["data"]["product_col"]          = PRODUCT_COL
-        cfg["data"]["event_extra_cols"]     = []  # on n'utilise pas le profil pour limiter la RAM
 
-        cfg["sequence"]["months_lookback"]  = results_row["seq_lookback"]
-        cfg["sequence"]["time_granularity"] = "M"
-        cfg["sequence"]["min_events_per_client"] = 1
-        cfg["sequence"]["target_horizon"]   = 1
-        cfg["sequence"]["pad_value"]        = 0
-        cfg["sequence"]["build_target_from_events"] = True
+def ensure_dir(p: str):
+    os.makedirs(p, exist_ok=True)
 
-        cfg["features"]["exclude_target_values"] = list(EXCLUDE_LABELS)
-        cfg["features"]["merge_rare_threshold"]  = MERGE_RARE_THRESHOLD
-        cfg["features"]["other_class_name"]      = "AUTRES_PRODUITS"
 
-        cfg["model"]["d_model"]            = D_MODEL
-        cfg["model"]["n_heads"]            = N_HEADS
-        cfg["model"]["n_layers"]           = N_LAYERS
-        cfg["model"]["dropout"]            = 0.10
-        cfg["model"]["max_sequence_length"] = results_row["seq_lookback"]
-        cfg["model"]["vocab_size"]         = 2000
+# ===================== MAIN =========================
+def main():
+    np.random.seed(RANDOM_SEED)
 
-        cfg["training"]["batch_size"]      = BATCH_SIZE
-        cfg["training"]["num_epochs"]      = EPOCHS
-        cfg["training"]["learning_rate"]   = LEARNING_RATE
-        cfg["training"]["weight_decay"]    = 1e-4
-        cfg["training"]["val_split"]       = VAL_SPLIT
-        cfg["training"]["class_weighting"] = True
-        cfg["training"]["gradient_clip"]   = 1.0
-        cfg["training"]["optimizer"]       = "adamw"
+    log.info("=== DRIVER START (in-memory, with non-empty guarantees) ===")
+    log.info("== STEP 1: BUILD EVENTS (stratified) ==")
 
-        cfg["outputs"]["features_dataset"]        = None
-        cfg["outputs"]["predictions_dataset"]     = None
-        cfg["outputs"]["metrics_dataset"]         = None
-        cfg["outputs"]["model_artifacts_dataset"] = None
-        cfg["outputs"]["local_dir"]               = "output"
+    # 1) Build events (avec garanties non-vides)
+    try:
+        df_events, meta = build_events_stratified_across_months(
+            limit_rows=LIMIT_ROWS,
+            months_back=MONTHS_BACK_TARGET,
+            per_month_cap=PER_MONTH_CAP,
+            min_client_months=MIN_CLIENT_MONTHS,
+            exclude_on_events=EXCLUDE_ON_EVENTS
+        )
+    except Exception as e:
+        log.error(f"BUILD EVENTS failed: {e}")
+        raise
 
-        cfg["runtime"]["verbose"]  = True
-        cfg["runtime"]["progress"] = True
-        cfg["runtime"]["seed"]     = 42
+    log.info(f"Sample months (target): {meta['selected_months']}")
+    log.info(f"df_events: rows={len(df_events):,} | clients={meta['n_clients']:,} | months={meta['n_months']}")
+    try:
+        vc = df_events[PRODUCT_COL].astype(str).value_counts().head(10)
+        log.info(f"Top target values:\n{vc}")
+    except Exception:
+        pass
 
-        # Entraînement
-        res = run_training(cfg)
+    # 2) Config (in-memory, no IO)
+    log.info("== STEP 2: CONFIG (in-memory, no IO) ==")
+    cfg = blank_config()
 
-        train_secs = time.time() - t0
-        m = res.get("metrics", {})
-        results_row.update({
-            "n_classes":   res.get("data_info", {}).get("n_classes"),
-            "val_accuracy": float(m.get("accuracy")) if m else None,
-            "precision":   float(m.get("precision")) if m else None,
-            "recall":      float(m.get("recall")) if m else None,
-            "f1":          float(m.get("f1")) if m else None,
-            "train_seconds": float(train_secs),
-            "notes":       "bounded events + mini-train CPU",
-        })
-        log.info("Training done: acc=%.4f | f1=%.4f | n_classes=%s",
-                 results_row["val_accuracy"] or -1,
-                 results_row["f1"] or -1,
-                 results_row["n_classes"])
+    # Données (on passe df_events en mémoire → pipeline ne relira pas Dataiku)
+    cfg["data"]["events_df"]          = df_events
+    cfg["data"]["events_dataset"]     = ""  # ignoré car events_df est fourni
+    cfg["data"]["client_id_col"]      = CLIENT_ID_COL
+    cfg["data"]["event_time_col"]     = TIME_COL
+    cfg["data"]["product_col"]        = PRODUCT_COL
+    cfg["data"]["event_extra_cols"]   = list(EXTRA_EVENT_COLS)
 
-    # 4) WRITE results (sortie n°2) — schéma SANS doublons
-    RESULTS_COLS = [
-        "run_id","ts","rows_scanned","rows_kept","keep_months","min_client_months",
-        "limit_rows","chunksize","time_budget_secs","n_chunks","seq_lookback",
-        "d_model","n_heads","n_layers","batch_size","merge_rare_threshold",
-        "exclude_labels","n_classes","val_accuracy","precision","recall","f1",
-        "train_seconds","notes"
-    ]
-    # normalise ordre + types
-    row_norm = {k: results_row.get(k, None) for k in RESULTS_COLS}
-    if row_norm["ts"] is not None:
-        row_norm["ts"] = pd.to_datetime(row_norm["ts"])
-    results_df = pd.DataFrame([row_norm], columns=RESULTS_COLS)
+    # Profil OFF (pour RAM)
+    cfg["data"]["dataset_name"]             = ""
+    cfg["data"]["profile_categorical_cols"] = []
+    cfg["data"]["profile_sequence_cols"]    = []
+    cfg["data"]["profile_df"]               = None
+    cfg["data"]["profile_join_key"]         = CLIENT_ID_COL
 
-    write_dataset_safe(OUT_RESULTS_NAME, results_df)
-    log.info("Wrote %s: %s", OUT_RESULTS_NAME, results_df.shape)
+    # Séquence — on borne lookback par les mois réellement présents
+    months_present = int(meta["n_months"])
+    lookback = max(1, min(12, months_present))  # 12 si possible, sinon nb de mois dispo
+    cfg["sequence"]["months_lookback"]          = lookback
+    cfg["sequence"]["time_granularity"]         = "M"
+    cfg["sequence"]["min_events_per_client"]    = 1
+    cfg["sequence"]["target_horizon"]           = 1
+    cfg["sequence"]["pad_value"]                = 0
+    cfg["sequence"]["build_target_from_events"] = True
+
+    # Features — on a déjà exclu côté événements → on ne double-pas ici
+    cfg["features"]["exclude_target_values"] = []
+    cfg["features"]["merge_rare_threshold"]  = MERGE_RARE_THRESHOLD
+    cfg["features"]["other_class_name"]      = OTHER_CLASS_NAME
+
+    # Modèle (petit)
+    cfg["model"]["d_model"]             = D_MODEL
+    cfg["model"]["n_heads"]             = N_HEADS
+    cfg["model"]["n_layers"]            = N_LAYERS
+    cfg["model"]["dropout"]             = 0.10
+    cfg["model"]["max_sequence_length"] = lookback
+    cfg["model"]["vocab_size"]          = 2000
+
+    # Entraînement (CPU)
+    cfg["training"]["batch_size"]      = BATCH_SIZE
+    cfg["training"]["num_epochs"]      = EPOCHS
+    cfg["training"]["learning_rate"]   = LEARNING_RATE
+    cfg["training"]["weight_decay"]    = 1e-4
+    cfg["training"]["val_split"]       = VAL_SPLIT
+    cfg["training"]["class_weighting"] = True
+    cfg["training"]["gradient_clip"]   = 1.0
+    cfg["training"]["optimizer"]       = "adamw"
+
+    # Sorties (on n’écrit pas les datasets ici ; juste un CSV local d’expériences)
+    cfg["outputs"]["features_dataset"]        = None
+    cfg["outputs"]["predictions_dataset"]     = None
+    cfg["outputs"]["metrics_dataset"]         = None
+    cfg["outputs"]["model_artifacts_dataset"] = None
+    cfg["outputs"]["local_dir"]               = OUT_DIR
+
+    cfg["runtime"]["verbose"]  = True
+    cfg["runtime"]["progress"] = True
+    cfg["runtime"]["seed"]     = RANDOM_SEED
+
+    log.info(f"Archi: {cfg['model']['n_layers']}L-{cfg['model']['n_heads']}H-{cfg['model']['d_model']}D")
+    log.info(f"Seq:   {cfg['sequence']['months_lookback']} mois | horizon={cfg['sequence']['target_horizon']}")
+    log.info(f"Exclu (events level)? {EXCLUDE_ON_EVENTS}")
+    log.info("OK config.")
+
+    # 3) Train
+    log.info("== STEP 3: TRAIN (CPU) ==")
+    t0 = time.time()
+    results = run_training(cfg)
+    t_train = time.time() - t0
+    log.info("Training finished.")
+    log.info(f"Train time: {t_train:.1f}s")
+
+    # 4) Metrics + experiment log CSV
+    log.info("== STEP 4: METRICS ==")
+    m = results.get("metrics", {})
+    mi = results.get("model_info", {})
+    di = results.get("data_info", {})
+
+    acc = float(m.get("accuracy", 0.0))
+    prec = float(m.get("precision", 0.0))
+    rec = float(m.get("recall", 0.0))
+    f1  = float(m.get("f1", 0.0))
+
+    log.info(f"accuracy  : {acc:.4f}")
+    log.info(f"precision : {prec:.4f}")
+    log.info(f"recall    : {rec:.4f}")
+    log.info(f"f1        : {f1:.4f}")
+    log.info(f"Model: {mi.get('architecture','N/A')} | params≈ {mi.get('total_params','NA'):,}")
+    log.info(f"Data : clients={di.get('n_clients','NA')} | seq_len={di.get('seq_len','NA')} | classes={di.get('n_classes','NA')}")
+
+    # CSV d’expériences
+    ensure_dir(OUT_DIR)
+    row = {
+        "timestamp": datetime.now().isoformat(),
+        "rows": len(df_events),
+        "clients": int(meta["n_clients"]),
+        "months": int(meta["n_months"]),
+        "selected_months_head": ";".join(map(str, meta["selected_months"][:3])),
+        "lookback": lookback,
+        "exclude_on_events": int(EXCLUDE_ON_EVENTS),
+        "merge_rare_threshold": MERGE_RARE_THRESHOLD,
+        "d_model": D_MODEL,
+        "n_heads": N_HEADS,
+        "n_layers": N_LAYERS,
+        "batch_size": BATCH_SIZE,
+        "epochs": EPOCHS,
+        "lr": LEARNING_RATE,
+        "val_split": VAL_SPLIT,
+        "accuracy": acc,
+        "precision": prec,
+        "recall": rec,
+        "f1": f1,
+        "n_classes": int(di.get("n_classes", -1)),
+        "seq_len": int(di.get("seq_len", -1)),
+        "train_time_s": float(t_train),
+    }
+    df_log = pd.DataFrame([row])
+    if os.path.exists(EXP_LOG_CSV):
+        df_log.to_csv(EXP_LOG_CSV, index=False, mode="a", header=False)
+    else:
+        df_log.to_csv(EXP_LOG_CSV, index=False)
+    log.info(f"Experiment row appended to {EXP_LOG_CSV}")
 
     log.info("=== DRIVER DONE ===")
+
 
 if __name__ == "__main__":
     main()
